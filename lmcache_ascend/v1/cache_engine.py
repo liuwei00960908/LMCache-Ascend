@@ -1580,19 +1580,31 @@ class AscendLMCacheEngine(LMCacheEngine):
         next(mem_obj_consumer)
 
         for layer_id in range(self.num_layers):
-            selected_tokens, token_start_index = yield ret_mask
+            sparse_payload = yield ret_mask
+            if isinstance(sparse_payload, dict):
+                selected_tokens = sparse_payload.get("selected_token_ids")
+                token_start_index = None
+                target_slot_mapping = sparse_payload.get("target_slot_mapping")
+            else:
+                selected_tokens, token_start_index = sparse_payload
+                target_slot_mapping = None
             if _dsa_debug_should_log(self, "head_retrieve_layer"):
                 logger.warning(
                     "[DSA_SHRINK_CHECK] lmcache_ascend_head_layer "
                     "req=%s layer=%s selected_shape=%s selected_sample=%s "
                     "selected_minmax_count=%s token_start_index=%s "
-                    "use_cached_retrieve=%s cached_mem_layers=%s",
+                    "target_slot_shape=%s target_slot_sample=%s "
+                    "target_slot_minmax_count=%s use_cached_retrieve=%s "
+                    "cached_mem_layers=%s",
                     kwargs.get("req_id"),
                     layer_id,
                     _dsa_debug_shape(selected_tokens),
                     _dsa_debug_sample(selected_tokens),
                     _dsa_debug_minmax_count(selected_tokens),
                     token_start_index,
+                    _dsa_debug_shape(target_slot_mapping),
+                    _dsa_debug_sample(target_slot_mapping),
+                    _dsa_debug_minmax_count(target_slot_mapping),
                     use_cached_retrieve,
                     cached_mem_layers is not None,
                 )
@@ -1648,9 +1660,14 @@ class AscendLMCacheEngine(LMCacheEngine):
                 tensors=tensors_for_validation,
             )
 
-            mem_obj_consumer.send(
-                (mem_objs_layer, selected_tokens, token_start_index)
-            )
+            if isinstance(sparse_payload, dict):
+                payload = dict(sparse_payload)
+                payload["memory_objs_layer"] = mem_objs_layer
+                mem_obj_consumer.send(payload)
+            else:
+                mem_obj_consumer.send(
+                    (mem_objs_layer, selected_tokens, token_start_index)
+                )
 
         next(mem_obj_consumer)
 
