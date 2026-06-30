@@ -1615,7 +1615,29 @@ class AscendLMCacheEngine(LMCacheEngine):
         next(mem_obj_consumer)
 
         for layer_id in range(self.num_layers):
-            selected_tokens, token_start_index = yield ret_mask
+            if _dsa_debug_enabled():
+                logger.warning(
+                    "[DSA_SHRINK_CHECK] lmcache_ascend_head_yield "
+                    "req=%s layer=%s num_layers=%s use_cached_retrieve=%s "
+                    "cached_mem_layers=%s ret_mask_shape=%s",
+                    kwargs.get("req_id"),
+                    layer_id,
+                    self.num_layers,
+                    use_cached_retrieve,
+                    cached_mem_layers is not None,
+                    _dsa_debug_shape(ret_mask),
+                )
+            received = yield ret_mask
+            if _dsa_debug_enabled():
+                logger.warning(
+                    "[DSA_SHRINK_CHECK] lmcache_ascend_head_recv "
+                    "req=%s layer=%s received_is_none=%s received_type=%s",
+                    kwargs.get("req_id"),
+                    layer_id,
+                    received is None,
+                    type(received).__name__,
+                )
+            selected_tokens, token_start_index = received
             if _dsa_debug_should_log(self, "head_retrieve_layer"):
                 logger.warning(
                     "[DSA_SHRINK_CHECK] lmcache_ascend_head_layer "
@@ -1689,6 +1711,14 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         next(mem_obj_consumer)
 
+        if _dsa_debug_enabled():
+            logger.warning(
+                "[DSA_SHRINK_CHECK] lmcache_ascend_head_final_yield "
+                "req=%s num_layers=%s ret_mask_shape=%s",
+                kwargs.get("req_id"),
+                self.num_layers,
+                _dsa_debug_shape(ret_mask),
+            )
         yield ret_mask
 
 
