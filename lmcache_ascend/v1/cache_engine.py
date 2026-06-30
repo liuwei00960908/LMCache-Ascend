@@ -1227,6 +1227,19 @@ class AscendLMCacheEngine(LMCacheEngine):
         else:
             num_to_store_tokens = len(tokens)
 
+        if _dsa_debug_enabled():
+            logger.warning(
+                "[DSA_STORE_DBG] ascend_store_layer enter req_id=%s "
+                "tokens_len=%s num_to_store=%s has_mask=%s offset=%s "
+                "cached_keys_layers=%s",
+                req_id,
+                len(tokens),
+                num_to_store_tokens,
+                mask is not None,
+                kwargs.get("offset"),
+                len(kwargs.get("cached_keys") or []),
+            )
+
         # KVCache Check logging
         self._log_kvcache_for_check(
             operation="Layerwise store",
@@ -1338,6 +1351,19 @@ class AscendLMCacheEngine(LMCacheEngine):
                 self.kv_events.append(stored_event)
                 prev_key = key.chunk_hash
 
+        if _dsa_debug_enabled():
+            logger.warning(
+                "[DSA_STORE_DBG] ascend_store_layer keys_ready req_id=%s "
+                "chunk_count=%s starts=%s ends=%s tot_token_num=%s "
+                "num_to_store=%s",
+                req_id,
+                len(keys),
+                starts,
+                ends,
+                tot_token_num,
+                num_to_store_tokens,
+            )
+
         if keys:
             # Transpose the keys and memory objects into layer major format
             memory_objs = [list(row) for row in zip(*memory_objs, strict=False)]
@@ -1397,6 +1423,15 @@ class AscendLMCacheEngine(LMCacheEngine):
                 tot_kv_size / tot_time / 1024**3 if tot_time > 0 else 0,
             )
         else:
+            if _dsa_debug_enabled():
+                logger.warning(
+                    "[DSA_STORE_DBG] ascend_store_layer empty_keys req_id=%s "
+                    "tokens_len=%s num_to_store=%s offset=%s",
+                    req_id,
+                    len(tokens),
+                    num_to_store_tokens,
+                    kwargs.get("offset"),
+                )
             # If no cache are found, we still need to yield to avoid
             # `StopIteration`
             for layer_id in range(self.num_layers):
