@@ -960,21 +960,203 @@ class AscendLMCacheEngine(LMCacheEngine):
         if cached_tensors is not None and not cached_tensors:
             cached_tensors.extend([] for _ in range(num_layers))
 
+    def _replace_layerwise_store_cache_chunks(
+        self,
+        *,
+        keys: List[List[CacheEngineKey]],
+        starts: List[int],
+        ends: List[int],
+        memory_objs: List[List[MemoryObj]],
+        replace_chunk_idx: int,
+        cached_keys: Optional[List],
+        cached_starts: Optional[List[int]],
+        cached_ends: Optional[List[int]],
+        cached_memory_objs: Optional[List],
+        cached_tensors: Optional[List],
+    ) -> None:
+        """Replace the cached tail chunk and append any chunks created after it."""
+        num_layers = len(keys)
+        replace_slice = slice(replace_chunk_idx, replace_chunk_idx + 1)
+        if cached_starts is not None:
+            cached_starts[replace_slice] = starts
+        if cached_ends is not None:
+            cached_ends[replace_slice] = ends
+        if cached_keys is not None:
+            if not cached_keys:
+                cached_keys.extend([] for _ in range(num_layers))
+            assert len(cached_keys) == num_layers, (
+                f"cached_keys has {len(cached_keys)} layers, expected {num_layers}"
+            )
+            for layer_id, layer_keys in enumerate(keys):
+                cached_keys[layer_id][replace_slice] = layer_keys
+        if cached_memory_objs is not None:
+            if not cached_memory_objs:
+                cached_memory_objs.extend([] for _ in range(num_layers))
+            assert len(cached_memory_objs) == num_layers
+            for layer_id, layer_objs in enumerate(memory_objs):
+                cached_memory_objs[layer_id][replace_slice] = layer_objs
+        if cached_tensors is not None and not cached_tensors:
+            cached_tensors.extend([] for _ in range(num_layers))
+
     def _append_layer_store_tensors(
         self,
         layer_id: int,
         memory_objs: List[List[MemoryObj]],
         cached_tensors: Optional[List],
+        replace_chunk_idx: Optional[int] = None,
     ) -> None:
         if cached_tensors is None:
             return
         while len(cached_tensors) <= layer_id:
             cached_tensors.append([])
-        cached_tensors[layer_id].extend(
-            mem_obj.tensor
-            for mem_obj in memory_objs[layer_id]
+        new_tensors = [
+            mem_obj.tensor for mem_obj in memory_objs[layer_id]
             if mem_obj.tensor is not None
+        ]
+        if replace_chunk_idx is None:
+            cached_tensors[layer_id].extend(new_tensors)
+        else:
+            replace_slice = slice(replace_chunk_idx, replace_chunk_idx + 1)
+            cached_tensors[layer_id][replace_slice] = new_tensors
+
+    @staticmethod
+    def _cached_chunk_index(
+        cached_starts: Optional[List[int]],
+        cached_ends: Optional[List[int]],
+        start: int,
+        end: int,
+    ) -> Optional[int]:
+        if cached_starts is None or cached_ends is None:
+            return None
+        for idx, (cached_start, cached_end) in enumerate(
+            zip(cached_starts, cached_ends, strict=False)
+        ):
+            if cached_start == start and cached_end == end:
+                return idx
+        return None
+
+    @staticmethod
+    def _cached_layer_tensors_at(
+        cached_tensors: Optional[List],
+        cached_memory_objs: Optional[List],
+        chunk_idx: int,
+        num_layers: int,
+    ) -> List[Optional[torch.Tensor]]:
+        tensors: List[Optional[torch.Tensor]] = []
+        for layer_id in range(num_layers):
+            tensor = None
+            if (
+                cached_tensors is not None
+                and layer_id < len(cached_tensors)
+                and chunk_idx < len(cached_tensors[layer_id])
+            ):
+                tensor = cached_tensors[layer_id][chunk_idx]
+            elif (
+                cached_memory_objs is not None
+                and layer_id < len(cached_memory_objs)
+                and chunk_idx < len(cached_memory_objs[layer_id])
+            ):
+                mem_obj = cached_memory_objs[layer_id][chunk_idx]
+                tensor = mem_obj.tensor if mem_obj is not None else None
+            tensors.append(tensor)
+        return tensors
+
+    def _plane_major_dims_for_tensor(
+        self,
+        tensor: torch.Tensor,
+        num_tokens: int,
+    ) -> List[int]:
+        if num_tokens <= 0 or tensor.numel() % num_tokens != 0:
+            return []
+        dims = [
+            int(getattr(self.gpu_connector, name, 0) or 0)
+            for name in ("k_hidden_dims", "v_hidden_dims", "dsa_hidden_dims")
+        ]
+        dims = [dim for dim in dims if dim > 0]
+        if dims and sum(dims) * num_tokens == tensor.numel():
+            return dims
+        return []
+
+    def _copy_sparse_store_prefix_tokens(
+        self,
+        dst: torch.Tensor,
+        src: torch.Tensor,
+        prefix_tokens: int,
+        dst_tokens: int,
+        src_tokens: int,
+    ) -> None:
+        if prefix_tokens <= 0:
+            return
+        if src_tokens < prefix_tokens:
+            raise RuntimeError(
+                "Sparse decode tail merge source is shorter than the prefix "
+                f"to preserve: src_tokens={src_tokens}, prefix={prefix_tokens}."
+            )
+        if dst_tokens < prefix_tokens:
+            raise RuntimeError(
+                "Sparse decode tail merge destination is shorter than the prefix "
+                f"to preserve: dst_tokens={dst_tokens}, prefix={prefix_tokens}."
+            )
+
+        if dst.ndim >= 3 and src.ndim >= 3:
+            dst[:prefix_tokens].copy_(src[:prefix_tokens])
+            return
+
+        dst_flat = dst.reshape(-1)
+        src_flat = src.reshape(-1)
+        plane_dims = self._plane_major_dims_for_tensor(dst_flat, dst_tokens)
+        if plane_dims and sum(plane_dims) * src_tokens == src_flat.numel():
+            src_offset = 0
+            dst_offset = 0
+            for dim in plane_dims:
+                elems = dim * prefix_tokens
+                dst_flat[dst_offset : dst_offset + elems].copy_(
+                    src_flat[src_offset : src_offset + elems]
+                )
+                src_offset += dim * src_tokens
+                dst_offset += dim * dst_tokens
+            return
+
+        dst_per_token = dst_flat.numel() // dst_tokens
+        src_per_token = src_flat.numel() // src_tokens
+        if dst_per_token != src_per_token:
+            raise RuntimeError(
+                "Sparse decode tail merge tensor layouts differ: "
+                f"dst_per_token={dst_per_token}, src_per_token={src_per_token}."
+            )
+        elems = dst_per_token * prefix_tokens
+        dst_flat[:elems].copy_(src_flat[:elems])
+
+    def _merge_sparse_store_prefix_for_layer(
+        self,
+        *,
+        layer_id: int,
+        memory_objs: List[List[MemoryObj]],
+        old_prefix_tensors: List[Optional[torch.Tensor]],
+        prefix_tokens: int,
+        dst_tokens: int,
+        src_tokens: int,
+        req_id: str,
+    ) -> None:
+        if prefix_tokens <= 0:
+            return
+        if not memory_objs[layer_id]:
+            return
+        dst_tensor = memory_objs[layer_id][0].tensor
+        src_tensor = old_prefix_tensors[layer_id]
+        if dst_tensor is None or src_tensor is None:
+            raise RuntimeError(
+                "Sparse decode tail merge requires the previous partial chunk "
+                f"tensor for req_id={req_id}, layer={layer_id}."
+            )
+        self._copy_sparse_store_prefix_tokens(
+            dst_tensor,
+            src_tensor,
+            prefix_tokens,
+            dst_tokens,
+            src_tokens,
         )
+
 
     def _append_retrieve_layer_cache(
         self,
@@ -1278,6 +1460,67 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_chunk_dev_ptrs = kwargs.get("cached_chunk_dev_ptrs")
         cached_chunk_ptrs_npu = kwargs.get("cached_chunk_ptrs_npu")
 
+        replace_chunk_idx: Optional[int] = None
+        old_prefix_tensors: List[Optional[torch.Tensor]] = []
+        prefix_tokens_to_merge = 0
+        old_prefix_chunk_tokens = 0
+        is_sparse_decode_store = bool(kwargs.get("is_sparse_decode", False))
+        if is_sparse_decode_store and mask is not None:
+            skip_leading_tokens = int(mask.numel() - mask.long().sum().item())
+            chunk_size = int(
+                getattr(self.config, "chunk_size", 0)
+                or getattr(self.token_database, "chunk_size", 0)
+                or 0
+            )
+            if chunk_size > 0 and skip_leading_tokens % chunk_size != 0:
+                aligned_skip_tokens = skip_leading_tokens // chunk_size * chunk_size
+                prefix_tokens_to_merge = skip_leading_tokens - aligned_skip_tokens
+                old_prefix_chunk_tokens = prefix_tokens_to_merge
+                replace_chunk_idx = self._cached_chunk_index(
+                    cached_starts,
+                    cached_ends,
+                    aligned_skip_tokens,
+                    skip_leading_tokens,
+                )
+                if replace_chunk_idx is None:
+                    raise RuntimeError(
+                        "Sparse decode save cannot rewrite a non-aligned tail "
+                        "without the previous partial chunk: "
+                        f"req_id={req_id}, aligned_start={aligned_skip_tokens}, "
+                        f"old_end={skip_leading_tokens}."
+                    )
+                old_prefix_tensors = self._cached_layer_tensors_at(
+                    cached_tensors,
+                    cached_memory_objs,
+                    replace_chunk_idx,
+                    self.num_layers,
+                )
+                if any(tensor is None for tensor in old_prefix_tensors):
+                    raise RuntimeError(
+                        "Sparse decode save cannot merge the previous tail because "
+                        f"one or more layer tensors are missing for req_id={req_id}, "
+                        f"chunk_idx={replace_chunk_idx}."
+                    )
+                rewrite_mask = torch.ones_like(mask)
+                rewrite_mask[:aligned_skip_tokens] = False
+                mask = rewrite_mask
+                num_to_store_tokens = int(torch.sum(mask).item())
+                kwargs["offset"] = aligned_skip_tokens
+                if _dsa_debug_enabled():
+                    logger.warning(
+                        "[DSA_STORE_DBG] ascend_store_layer sparse_tail_rewrite "
+                        "req_id=%s skip_leading=%s aligned_skip=%s "
+                        "prefix_merge=%s replace_chunk_idx=%s tokens_len=%s "
+                        "num_to_store=%s",
+                        req_id,
+                        skip_leading_tokens,
+                        aligned_skip_tokens,
+                        prefix_tokens_to_merge,
+                        replace_chunk_idx,
+                        len(tokens),
+                        num_to_store_tokens,
+                    )
+
         starts = []
         ends = []
         keys = []
@@ -1296,7 +1539,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
             keys_multi_layer = key.split_layers(self.num_layers)
             # Only check the first layer
-            if self.storage_manager.contains(
+            if replace_chunk_idx is None and self.storage_manager.contains(
                 keys_multi_layer[0], self.retrieve_locations
             ):
                 continue
@@ -1376,17 +1619,35 @@ class AscendLMCacheEngine(LMCacheEngine):
 
             assert_layerwise_gpu_connector(self.gpu_connector)
 
-            self._append_layerwise_store_cache_chunks(
-                keys=keys,
-                starts=starts,
-                ends=ends,
-                memory_objs=memory_objs,
-                cached_keys=cached_keys,
-                cached_starts=cached_starts,
-                cached_ends=cached_ends,
-                cached_memory_objs=cached_memory_objs,
-                cached_tensors=cached_tensors,
-            )
+            if replace_chunk_idx is None:
+                self._append_layerwise_store_cache_chunks(
+                    keys=keys,
+                    starts=starts,
+                    ends=ends,
+                    memory_objs=memory_objs,
+                    cached_keys=cached_keys,
+                    cached_starts=cached_starts,
+                    cached_ends=cached_ends,
+                    cached_memory_objs=cached_memory_objs,
+                    cached_tensors=cached_tensors,
+                )
+            else:
+                self._replace_layerwise_store_cache_chunks(
+                    keys=keys,
+                    starts=starts,
+                    ends=ends,
+                    memory_objs=memory_objs,
+                    replace_chunk_idx=replace_chunk_idx,
+                    cached_keys=cached_keys,
+                    cached_starts=cached_starts,
+                    cached_ends=cached_ends,
+                    cached_memory_objs=cached_memory_objs,
+                    cached_tensors=cached_tensors,
+                )
+                if cached_chunk_dev_ptrs is not None:
+                    cached_chunk_dev_ptrs.clear()
+                if cached_chunk_ptrs_npu is not None:
+                    cached_chunk_ptrs_npu.clear()
 
             t_start = time.perf_counter()
             mem_obj_generator = self.gpu_connector.batched_from_gpu(
@@ -1398,8 +1659,21 @@ class AscendLMCacheEngine(LMCacheEngine):
             for layer_id in range(self.num_layers):
                 yield
                 next(mem_obj_generator)
+                if replace_chunk_idx is not None:
+                    self._merge_sparse_store_prefix_for_layer(
+                        layer_id=layer_id,
+                        memory_objs=memory_objs,
+                        old_prefix_tensors=old_prefix_tensors,
+                        prefix_tokens=prefix_tokens_to_merge,
+                        dst_tokens=ends[0] - starts[0],
+                        src_tokens=old_prefix_chunk_tokens,
+                        req_id=req_id,
+                    )
                 self._append_layer_store_tensors(
-                    layer_id, memory_objs, cached_tensors
+                    layer_id,
+                    memory_objs,
+                    cached_tensors,
+                    replace_chunk_idx=replace_chunk_idx,
                 )
                 self._dsa_record_store_digests(
                     req_id=req_id,
