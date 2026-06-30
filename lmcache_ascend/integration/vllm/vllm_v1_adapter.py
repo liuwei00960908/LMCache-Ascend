@@ -6,6 +6,9 @@ from typing import TYPE_CHECKING, Any, Optional
 from lmcache.integration.vllm.vllm_v1_adapter import (
     LMCacheConnectorMetadata,
     LMCacheConnectorV1Impl,
+    _dsa_debug_limit,
+    _dsa_debug_shape,
+    _dsa_debug_should_log,
 )
 from lmcache.logging import init_logger
 from lmcache.utils import _lmcache_nvtx_annotate
@@ -55,6 +58,39 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
 
         connector_metadata = self._parent._get_connector_metadata()
         assert isinstance(connector_metadata, LMCacheConnectorMetadata)
+
+        if _dsa_debug_should_log(self, "ascend_wait_for_save"):
+            request_summaries = []
+            for request in connector_metadata.requests[: _dsa_debug_limit()]:
+                save_spec = request.save_spec
+                request_summaries.append(
+                    {
+                        "req_id": request.req_id,
+                        "sparse": request.is_sparse_decode,
+                        "token_ids": len(request.token_ids),
+                        "slot_mapping": _dsa_debug_shape(request.slot_mapping[0])
+                        if request.slot_mapping else None,
+                        "can_save": save_spec.can_save
+                        if save_spec is not None else None,
+                        "skip_leading": save_spec.skip_leading_tokens
+                        if save_spec is not None else None,
+                    }
+                )
+            logger.warning(
+                "[DSA_STORE_DBG] lmcache_ascend_wait_for_save enter step=%s "
+                "impl_id=%s parent_id=%s metadata_id=%s parent_metadata_id=%s "
+                "kv_role=%s use_layerwise=%s store_async=%s requests=%s",
+                getattr(self, "_dsa_forward_step", None),
+                id(self),
+                id(self._parent),
+                id(connector_metadata),
+                id(self._parent._connector_metadata)
+                if self._parent._connector_metadata is not None else None,
+                self.kv_role,
+                self.use_layerwise,
+                self.store_async,
+                request_summaries,
+            )
 
         if self.kv_role == "kv_consumer":
             if self.lmcache_engine is not None:
