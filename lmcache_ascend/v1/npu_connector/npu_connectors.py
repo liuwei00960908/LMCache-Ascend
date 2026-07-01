@@ -28,6 +28,7 @@ from lmcache_ascend.v1.npu_connector.utils import (
     sparse_mla_dsa_batched_direct_kv_transfer,
     sparse_mla_dsa_batched_direct_kv_transfer_fast,
 )
+from lmcache_ascend.v1 import _retrieve_prof as _retr_prof
 from lmcache_ascend.v1.proxy_memory_obj import ProxyMemoryObj
 from lmcache_ascend.v1.transfer_context import AscendBaseTransferContext
 import lmcache_ascend.c_ops as lmc_ops
@@ -1618,6 +1619,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             else slot_mapping_packed
         )
 
+        _t_state = _retr_prof.begin("npu_state")
         layer_state = self._get_or_create_sparse_direct_layer_state(
             layer_id=layer_id,
             layer_tensors=resolve_tensors,
@@ -1630,6 +1632,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             sparse_v_hidden_dims=sparse_v_hidden_dims,
             sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
         )
+        _retr_prof.end(_t_state)
 
         with torch.cuda.stream(load_stream):
             load_stream.wait_stream(current_stream)
@@ -1649,6 +1652,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         )
                         if self._sparse_direct_layer_states is not None else None,
                     )
+                _t_kernel = _retr_prof.begin("npu_kernel")
                 sparse_mla_dsa_batched_direct_kv_transfer_fast(
                     layer_state,
                     slot_mapping_packed,
@@ -1659,6 +1663,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     sparse_host_interleaved,
                     validate_inputs,
                 )
+                _retr_prof.end(_t_kernel)
+                _retr_prof.count("fast_path")
                 if validate_inputs:
                     self._sparse_direct_validated_layers.add(layer_id)
             else:
@@ -1669,6 +1675,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         "layer=%s path=direct validate_inputs=None",
                         layer_id,
                     )
+                _t_kernel = _retr_prof.begin("npu_kernel")
                 sparse_mla_dsa_batched_direct_kv_transfer(
                     cpu_tensors,
                     self.kvcaches[layer_id],
@@ -1685,8 +1692,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     sparse_host_interleaved,
                     chunk_ptrs_npu,
                 )
+                _retr_prof.end(_t_kernel)
+                _retr_prof.count("direct_path")
 
+        _t_sw = _retr_prof.begin("npu_stream_wait")
         current_stream.wait_stream(load_stream)
+        _retr_prof.end(_t_sw)
 
     def _sparse_selected_token_idx(
         self,
@@ -2109,11 +2120,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         for layer_id in range(self.num_layers):
             memory_objs_layer, selected_token_idx, token_start_index = yield
+            if selected_token_idx is not None:
+                _retr_prof.count("selected_in", float(selected_token_idx.numel()))
+            _t_pack = _retr_prof.begin("npu_pack")
             slot_mapping_packed, selected_token_idx = self._pack_sparse_layer_inputs(
                 slot_mapping,
                 selected_token_idx,
                 token_start_index,
             )
+            _retr_prof.end(_t_pack)
 
             layer_cached_tensors = (
                 cached_tensors_by_layer[layer_id]
@@ -2147,6 +2162,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         _dsa_debug_sample(selected_token_idx),
                         _dsa_debug_shape(slot_mapping_packed),
                     )
+                _retr_prof.step()
                 continue
 
             if (
@@ -2157,6 +2173,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             else:
                 total_tokens = self._sparse_total_tokens_from_layer_chunks(cpu_tensors)
 
+            _t_filter = _retr_prof.begin("npu_filter")
             selected_token_idx, slot_mapping_packed = (
                 self._filter_sparse_layer_inputs_to_cached_tokens(
                     layer_id=layer_id,
@@ -2167,15 +2184,22 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     lmcache_cached_tokens=lmcache_cached_tokens,
                 )
             )
+            _retr_prof.end(_t_filter)
+            if selected_token_idx is not None:
+                _retr_prof.count("selected_out", float(selected_token_idx.numel()))
             if selected_token_idx.numel() == 0:
+                _retr_prof.step()
                 continue
 
+            _t_resolve = _retr_prof.begin("npu_resolve_ptrs")
             chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
                 layer_id,
                 cpu_tensors,
                 cached_chunk_ptrs_npu,
             )
+            _retr_prof.end(_t_resolve)
 
+            _t_oob = _retr_prof.begin("npu_oob_check")
             selected_max = None
             selected_oob = False
             try:
@@ -2187,6 +2211,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             except Exception as exc:
                 selected_max = f"failed:{exc}"
                 selected_oob = True
+            _retr_prof.end(_t_oob)
             slot_selected_match = int(slot_mapping_packed.shape[0]) == int(
                 selected_token_idx.numel()
             )
@@ -2244,6 +2269,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     f"lmcache_cached_tokens={lmcache_cached_tokens}."
                 )
 
+            _t_run = _retr_prof.begin("npu_run_total")
             self._run_sparse_direct_kv_transfer_layer(
                 layer_id=layer_id,
                 load_stream=self.load_stream_list[load_stream_idx],
@@ -2264,6 +2290,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 slot_mapping_ref=slot_mapping,
                 cpu_tensors=cpu_tensors,
             )
+            _retr_prof.end(_t_run)
+            _retr_prof.step()
 
         yield
 

@@ -30,6 +30,8 @@ from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.token_database import TokenDatabase
 import torch
 
+from lmcache_ascend.v1 import _retrieve_prof as _retr_prof
+
 logger = init_logger(__name__)
 
 LOCAL_CPU_BACKEND_NAME = "LocalCPUBackend"
@@ -1801,6 +1803,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         if use_cached_retrieve:
             kwargs["_use_cached_retrieve"] = True
 
+        _t_md = _retr_prof.begin("ce_metadata")
         location, starts, ends, retrieve_keys = self._ensure_retrieve_chunk_metadata(
             tokens=tokens,
             mask=mask,
@@ -1811,6 +1814,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             ret_mask=ret_mask,
             retrieve_kwargs=kwargs,
         )
+        _retr_prof.end(_t_md)
         kwargs.pop("_use_cached_retrieve", None)
         if _dsa_debug_should_log(self, "head_retrieve_metadata"):
             slot_mapping = kwargs.get("slot_mapping")
@@ -1887,11 +1891,13 @@ class AscendLMCacheEngine(LMCacheEngine):
             else None
         )
 
+        _t_ic = _retr_prof.begin("ce_init_consumer")
         mem_obj_consumer = self.gpu_connector.batched_to_gpu_head_token_wise(**kwargs)
         notify_fn = getattr(self.gpu_connector, "notify_sparse_memory_objs_updated", None)
         if notify_fn is not None and not use_cached_retrieve:
             notify_fn()
         next(mem_obj_consumer)
+        _retr_prof.end(_t_ic)
 
         for layer_id in range(self.num_layers):
             if _dsa_debug_enabled():
@@ -1939,9 +1945,11 @@ class AscendLMCacheEngine(LMCacheEngine):
                 mem_objs_layer = []
             else:
                 assert get_generator is not None
+                _t_gm = _retr_prof.begin("ce_get_mem")
                 task = next(get_generator)
                 assert task is not None
                 mem_objs_layer = task.result()
+                _retr_prof.end(_t_gm)
                 if mem_objs_layer is not None:
                     layer_cached_chunks = (
                         len(cached_tensors[layer_id])
@@ -1977,16 +1985,20 @@ class AscendLMCacheEngine(LMCacheEngine):
                     and layer_id < len(cached_tensors)
                     else []
                 )
+            _t_dig = _retr_prof.begin("ce_digest")
             self._dsa_check_retrieve_digests(
                 req_id=str(kwargs.get("req_id")),
                 layer_id=layer_id,
                 keys=layer_keys,
                 tensors=tensors_for_validation,
             )
+            _retr_prof.end(_t_dig)
 
+            _t_sc = _retr_prof.begin("ce_send_consumer")
             mem_obj_consumer.send(
                 (mem_objs_layer, selected_tokens, token_start_index)
             )
+            _retr_prof.end(_t_sc)
 
         next(mem_obj_consumer)
 
