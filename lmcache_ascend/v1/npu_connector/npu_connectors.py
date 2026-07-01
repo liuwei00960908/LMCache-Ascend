@@ -1788,6 +1788,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             return MemoryFormat.KV_MLA_FMT
         return MemoryFormat.KV_T2D
 
+    def ensure_kvcache_format_initialized(self, **kwargs) -> None:
+        """Initialize KV format metadata before callers ask for CPU chunk shapes."""
+        self.initialize_kvcaches_ptr(**kwargs)
+        assert self.kvcaches is not None, (
+            "kvcaches should be provided in kwargs or initialized beforehand."
+        )
+        self._lazy_initialize_buffer(self.kvcaches)
+
     def _lazy_initialize_buffer(self, kv_caches):
         """
         Lazily initialize format metadata and the GPU buffer allocator.

@@ -1532,6 +1532,11 @@ class AscendLMCacheEngine(LMCacheEngine):
             assert isinstance(request_configs, dict)
 
         prev_key = 0
+        ensure_format_initialized = getattr(
+            self.gpu_connector, "ensure_kvcache_format_initialized", None
+        )
+        if ensure_format_initialized is not None:
+            ensure_format_initialized(**kwargs)
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens, mask=mask, request_configs=request_configs
         ):
