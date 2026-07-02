@@ -29,6 +29,7 @@ _WINDOW = max(1, int(os.getenv("VLLM_ASCEND_DSA_RETRIEVE_PROFILE_WINDOW", "78"))
 _acc: dict[str, float] = defaultdict(float)
 _n: dict[str, int] = defaultdict(int)
 _count: dict[str, float] = defaultdict(float)
+_count_n: dict[str, int] = defaultdict(int)
 _calls = [0]
 
 
@@ -78,6 +79,7 @@ def count(name: str, value: float = 1.0) -> None:
     if not ENABLED:
         return
     _count[name] += value
+    _count_n[name] += 1
 
 
 def step() -> None:
@@ -94,8 +96,8 @@ def step() -> None:
     parts = "  ".join(f"{k}={v:.3f}" for k, v in sorted(means.items()))
     avg_counts = {}
     for k in _count:
-        base = _n.get(k, 0) or _calls[0]
-        avg_counts[k] = _count[k] / base if base else 0.0
+        cnt = _count_n.get(k, 0)
+        avg_counts[k] = _count[k] / cnt if cnt else 0.0
     count_parts = "  ".join(f"{k}={v:.1f}" for k, v in sorted(avg_counts.items()))
     logger.info(
         "[DSA-RETR-PROF] window=%d calls=%d sync=%d  %s  counts: %s",
@@ -108,3 +110,4 @@ def step() -> None:
     _acc.clear()
     _n.clear()
     _count.clear()
+    _count_n.clear()
