@@ -69,10 +69,11 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             )
             for request in connector_metadata.requests:
                 layerwise_storer = self._layerwise_save_storers.pop(
-                    request.req_id, None
+                    self._layerwise_save_storer_key(request), None
                 )
                 if layerwise_storer is not None:
                     next(layerwise_storer)
+                    self._mark_decode_window_save_completed(request)
                 self._maybe_lookup_unpin_for_request(request)
             self._wait_for_save_done = True
             self._replay_finished_stores_after_save()
