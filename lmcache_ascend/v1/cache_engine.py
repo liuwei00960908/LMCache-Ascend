@@ -1275,9 +1275,16 @@ class AscendLMCacheEngine(LMCacheEngine):
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
 
+        _store_profile = os.getenv("LMCACHE_STORE_PROFILE", "0") == "1"
+
         prev_key = 0
         skipped_existing_chunks = 0
         allocation_failed = False
+
+        if _store_profile:
+            _sp_t_total = time.perf_counter()
+            _sp_t_process = time.perf_counter()
+
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens, mask=mask, request_configs=request_configs
         ):
@@ -1295,6 +1302,9 @@ class AscendLMCacheEngine(LMCacheEngine):
             num_tokens = end - start
             kv_shape_single_layer = self.gpu_connector.get_shape(num_tokens)
 
+            if _store_profile and not allocation_failed:
+                _sp_t_alloc = time.perf_counter()
+
             memory_objs_multi_layer = self.storage_manager.batched_allocate(
                 kv_shape_single_layer,
                 kv_dtype,
@@ -1310,6 +1320,12 @@ class AscendLMCacheEngine(LMCacheEngine):
                 )
                 allocation_failed = True
                 break
+
+            if _store_profile:
+                _sp_now = time.perf_counter()
+                _sp_alloc_sec = _sp_now - _sp_t_alloc
+                _sp_alloc_ms = _sp_alloc_sec * 1000
+                _sp_t_process_ms = ((_sp_now - _sp_t_process) - _sp_alloc_sec) * 1000
 
             starts.append(start)
             ends.append(end)
@@ -1373,9 +1389,17 @@ class AscendLMCacheEngine(LMCacheEngine):
 
             next(mem_obj_generator)
 
+            _sp_t_put_accum = 0.0
+            _sp_t_copy_accum = 0.0
             for layer_id in range(self.num_layers):
                 yield
+
+                if _store_profile:
+                    _sp_t_next = time.perf_counter()
                 next(mem_obj_generator)
+                if _store_profile:
+                    _sp_t_copy_accum += time.perf_counter() - _sp_t_next
+
                 self._append_layer_store_tensors(
                     layer_id, memory_objs, cached_tensors
                 )
@@ -1385,9 +1409,16 @@ class AscendLMCacheEngine(LMCacheEngine):
                     keys=keys[layer_id],
                     memory_objs=memory_objs[layer_id],
                 )
+
+                if _store_profile:
+                    _sp_t_put0 = time.perf_counter()
+
                 self.storage_manager.batched_put(
                     keys[layer_id], memory_objs[layer_id], location=self.store_location
                 )
+
+                if _store_profile:
+                    _sp_t_put_accum += time.perf_counter() - _sp_t_put0
 
             if kwargs.get("decode_window_save"):
                 window_start = kwargs.get("decode_window_start")
@@ -1430,6 +1461,24 @@ class AscendLMCacheEngine(LMCacheEngine):
                 tot_time * 1000,
                 tot_kv_size / tot_time / 1024**3 if tot_time > 0 else 0,
             )
+
+            if _store_profile:
+                _sp_total_ms = (time.perf_counter() - _sp_t_total) * 1000
+                _sp_copy_ms = _sp_t_copy_accum * 1000
+                _sp_put_ms = _sp_t_put_accum * 1000
+                logger.info(
+                    "[STORE_PROFILE] req=%s tokens=%d layers=%d "
+                    "process=%.1fms allocate=%.1fms copy=%.1fms put=%.1fms "
+                    "total=%.1fms",
+                    req_id,
+                    tot_token_num,
+                    self.num_layers,
+                    _sp_t_process_ms,
+                    _sp_alloc_ms,
+                    _sp_copy_ms,
+                    _sp_put_ms,
+                    _sp_total_ms,
+                )
         else:
             # If no cache are found, we still need to yield to avoid
             # `StopIteration`

@@ -2,6 +2,7 @@
 # Standard
 from typing import Any, List, Optional, Set, Union
 import os
+import time
 
 # Third Party
 from lmcache.integration.vllm.utils import ENGINE_NAME
@@ -484,9 +485,16 @@ class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
 
         current_stream = torch.cuda.current_stream()
 
+        _copy_profile = os.getenv("LMCACHE_STORE_PROFILE", "0") == "1"
+        if _copy_profile:
+            _cp_kernel_total = 0.0
+            _cp_sync_total = 0.0
+
         for layer_id in range(self.num_layers):
             memory_objs_layer = memory_objs[layer_id]
             # kvcaches -> gpu_buffer -> memobj
+            if _copy_profile:
+                _cp_k0 = time.perf_counter()
             with torch.cuda.stream(self.store_stream):
                 self.store_stream.wait_stream(current_stream)
 
@@ -518,12 +526,51 @@ class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
                     if self.cache_positions:
                         memory_obj.metadata.cached_positions = old_positions
 
+            if _copy_profile:
+                _cp_kernel_total += time.perf_counter() - _cp_k0
+
             yield
+
+            if _copy_profile:
+                _cp_s0 = time.perf_counter()
             self.store_stream.synchronize()
+            if _copy_profile:
+                _cp_sync_total += time.perf_counter() - _cp_s0
+
             logger.debug(f"Finished offloading layer {layer_id}")
 
         # free the buffer memory
         tmp_gpu_buffer_obj.ref_count_down()
+
+        if _copy_profile:
+            import time as _time_mod
+            _cp_bytes = sum(
+                mo.tensor.numel() * mo.tensor.element_size()
+                for layer_objs in memory_objs
+                for mo in layer_objs
+                if mo.tensor is not None
+            )
+            _cp_total = _cp_kernel_total + _cp_sync_total
+            _cp_k_ms = _cp_kernel_total * 1000
+            _cp_s_ms = _cp_sync_total * 1000
+            _cp_t_ms = _cp_total * 1000
+            _cp_bw = (_cp_bytes / (1024**3)) / _cp_total if _cp_total > 0 else 0
+            _cp_pk = (_cp_k_ms / self.num_layers) if self.num_layers > 0 else 0
+            _cp_ps = (_cp_s_ms / self.num_layers) if self.num_layers > 0 else 0
+            logger.warning(
+                "[COPY_PROFILE] layers=%d kernel=%.1fms sync=%.1fms "
+                "total=%.1fms per_layer=(%.2fms+%.2fms) bytes=%.4fGB "
+                "bandwidth=%.4fGB/s",
+                self.num_layers,
+                _cp_k_ms,
+                _cp_s_ms,
+                _cp_t_ms,
+                _cp_pk,
+                _cp_ps,
+                _cp_bytes / (1024**3),
+                _cp_bw,
+            )
+
         yield
 
 
@@ -2249,9 +2296,16 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         current_stream = torch.cuda.current_stream()
 
+        _copy_profile = os.getenv("LMCACHE_STORE_PROFILE", "0") == "1"
+        if _copy_profile:
+            _cp_kernel_total = 0.0
+            _cp_sync_total = 0.0
+
         for layer_id in range(self.num_layers):
             memory_objs_layer = memory_objs[layer_id]
             # kvcaches -> gpu_buffer -> memobj
+            if _copy_profile:
+                _cp_k0 = time.perf_counter()
             with torch.cuda.stream(self.store_stream):
                 self.store_stream.wait_stream(current_stream)
 
@@ -2302,14 +2356,51 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             dsa_hidden_dims,
                         )
                 logger.debug(f"Finished offloading layer {layer_id}")
+
+            if _copy_profile:
+                _cp_kernel_total += time.perf_counter() - _cp_k0
+
             yield
 
             if sync:
+                if _copy_profile:
+                    _cp_s0 = time.perf_counter()
                 self.store_stream.synchronize()
+                if _copy_profile:
+                    _cp_sync_total += time.perf_counter() - _cp_s0
 
         # free the buffer memory
         if self.use_gpu and tmp_gpu_buffer_obj is not None:
             tmp_gpu_buffer_obj.ref_count_down()
+
+        if _copy_profile:
+            _cp_bytes = sum(
+                mo.tensor.numel() * mo.tensor.element_size()
+                for layer_objs in memory_objs
+                for mo in layer_objs
+                if mo.tensor is not None
+            )
+            _cp_total = _cp_kernel_total + _cp_sync_total
+            _cp_k_ms = _cp_kernel_total * 1000
+            _cp_s_ms = _cp_sync_total * 1000
+            _cp_t_ms = _cp_total * 1000
+            _cp_bw = (_cp_bytes / (1024**3)) / _cp_total if _cp_total > 0 else 0
+            _cp_pk = (_cp_k_ms / self.num_layers) if self.num_layers > 0 else 0
+            _cp_ps = (_cp_s_ms / self.num_layers) if self.num_layers > 0 else 0
+            logger.warning(
+                "[COPY_PROFILE] layers=%d kernel=%.1fms sync=%.1fms "
+                "total=%.1fms per_layer=(%.2fms+%.2fms) bytes=%.4fGB "
+                "bandwidth=%.4fGB/s",
+                self.num_layers,
+                _cp_k_ms,
+                _cp_s_ms,
+                _cp_t_ms,
+                _cp_pk,
+                _cp_ps,
+                _cp_bytes / (1024**3),
+                _cp_bw,
+            )
+
         yield
 
 
