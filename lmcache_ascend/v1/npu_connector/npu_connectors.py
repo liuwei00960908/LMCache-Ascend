@@ -70,6 +70,33 @@ _DENSE_DIRECT_STORE_DISABLE = (
     or os.getenv("LMCACHE_ASCEND_DENSE_DIRECT_STORE_DISABLE", "0").lower()
     in ("1", "true", "yes", "on")
 )
+
+_DSA_PROF = os.getenv("VLLM_ASCEND_DSA_PROF", "0") == "1"
+_DSA_PROF_LAYERS = int(os.getenv("VLLM_ASCEND_DSA_PROF_LAYERS", "61"))
+_dsa_prof_wait_events: list = []
+_dsa_prof_wait_count = 0
+
+
+def _dsa_prof_record_wait(ev_a, ev_b):
+    global _dsa_prof_wait_count
+    _dsa_prof_wait_events.append((ev_a, ev_b))
+    _dsa_prof_wait_count += 1
+    if _dsa_prof_wait_count >= _DSA_PROF_LAYERS:
+        try:
+            torch.npu.synchronize()
+            total_wait = sum(a.elapsed_time(b) for a, b in _dsa_prof_wait_events)
+            n = len(_dsa_prof_wait_events)
+            print(
+                f"[DSA_WAIT] calls={n} wait_stream_total={total_wait:.1f}ms "
+                f"avg={total_wait / n:.2f}ms",
+                flush=True,
+            )
+        except Exception:
+            pass
+        _dsa_prof_wait_events.clear()
+        _dsa_prof_wait_count = 0
+
+
 def _payload_event_list(payload_event: Any) -> list[Any]:
     if payload_event is None:
         return []
@@ -2447,7 +2474,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     chunk_ptrs_npu,
                 )
 
+        if _DSA_PROF:
+            _ev_a = torch.npu.Event(enable_timing=True)
+            _ev_b = torch.npu.Event(enable_timing=True)
+            _ev_a.record()
         current_stream.wait_stream(load_stream)
+        if _DSA_PROF:
+            _ev_b.record()
+            _dsa_prof_record_wait(_ev_a, _ev_b)
 
     def _sparse_selected_token_idx(
         self,
