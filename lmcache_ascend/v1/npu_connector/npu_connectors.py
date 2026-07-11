@@ -3712,6 +3712,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             "cached_chunk_ptrs_npu"
         )
         lmcache_cached_tokens: int = int(kwargs.get("lmcache_cached_tokens", 0) or 0)
+        use_cached_retrieve: bool = bool(kwargs.get("_use_cached_retrieve", False))
 
         load_stream_idx = self.load_stream_idx
         self.load_stream_idx = (self.load_stream_idx + 1) % self.load_stream_num
@@ -3842,13 +3843,38 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 cached_chunk_ptrs_npu,
                 cached_chunk_dev_ptrs,
             )
+            physical_total_tokens = self._sparse_total_tokens_from_layer_chunks(
+                cpu_tensors, kv_group
+            )
             total_tokens = (
                 lmcache_cached_tokens
                 if lmcache_cached_tokens > 0
-                else self._sparse_total_tokens_from_layer_chunks(
-                    cpu_tensors, kv_group
-                )
+                else physical_total_tokens
             )
+
+            if _DSA_PROF and layer_id == 0:
+                chunk_count = int(chunk_ptrs_npu.numel())
+                covered = chunk_count * int(chunk_size)
+                sel_max = -1
+                sel_min = -1
+                if selected_token_idx.numel() > 0:
+                    sel_min = int(
+                        selected_token_idx.min().to(device="cpu").item()
+                    )
+                    sel_max = int(
+                        selected_token_idx.max().to(device="cpu").item()
+                    )
+                print(
+                    f"[SPARSE_DIRECT_INPUT] layer={layer_id} "
+                    f"use_cached_retrieve={use_cached_retrieve} "
+                    f"lmcache_cached_tokens={lmcache_cached_tokens} "
+                    f"physical_total_tokens={physical_total_tokens} "
+                    f"total_tokens={total_tokens} "
+                    f"chunk_count={chunk_count} covered_tokens={covered} "
+                    f"selected_shape={int(selected_token_idx.numel())} "
+                    f"selected_min={sel_min} selected_max={sel_max}",
+                    flush=True,
+                )
 
             if _SPARSE_DIRECT_DISABLE:
                 self._run_sparse_staging_kv_transfer_layer(

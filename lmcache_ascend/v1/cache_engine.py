@@ -33,6 +33,8 @@ import torch
 
 logger = init_logger(__name__)
 
+_DSA_PROF = os.getenv("VLLM_ASCEND_DSA_PROF", "0") == "1"
+
 LOCAL_CPU_BACKEND_NAME = "LocalCPUBackend"
 
 
@@ -2076,41 +2078,6 @@ class AscendLMCacheEngine(LMCacheEngine):
             retrieve_kwargs=kwargs,
         )
         kwargs.pop("_use_cached_retrieve", None)
-        if _dsa_debug_should_log(self, "head_retrieve_metadata"):
-            slot_mapping = kwargs.get("slot_mapping")
-            logger.warning(
-                "[DSA_SHRINK_CHECK] lmcache_ascend_head_retrieve "
-                "req=%s num_tokens=%s mask_shape=%s mask_minmax_count=%s "
-                "ret_mask_shape=%s ret_mask_minmax_count=%s slot_mapping_shape=%s "
-                "slot_mapping_sample=%s slot_mapping_minmax_count=%s "
-                "vllm_cached=%s lmcache_cached=%s metadata_warm=%s "
-                "use_cached_retrieve=%s cached_tensors_layers=%s "
-                "cached_mem_layers=%s cached_chunk_ptr_layers=%s "
-                "retrieve_key_groups=%s first_layer_chunks=%s starts_sample=%s "
-                "ends_sample=%s location=%s",
-                kwargs.get("req_id"),
-                num_tokens,
-                _dsa_debug_shape(mask),
-                _dsa_debug_minmax_count(mask),
-                _dsa_debug_shape(ret_mask),
-                _dsa_debug_minmax_count(ret_mask),
-                _dsa_debug_shape(slot_mapping),
-                _dsa_debug_sample(slot_mapping),
-                _dsa_debug_minmax_count(slot_mapping),
-                kwargs.get("vllm_cached_tokens"),
-                kwargs.get("lmcache_cached_tokens"),
-                metadata_warm,
-                use_cached_retrieve,
-                len(cached_tensors) if cached_tensors is not None else None,
-                len(cached_memory_objs) if cached_memory_objs is not None else None,
-                len(cached_chunk_ptrs_npu)
-                if cached_chunk_ptrs_npu is not None else None,
-                len(retrieve_keys) if retrieve_keys is not None else None,
-                len(retrieve_keys[0]) if retrieve_keys else 0,
-                _dsa_debug_sample(starts),
-                _dsa_debug_sample(ends),
-                location,
-            )
 
         required_chunks = len(retrieve_keys[0]) if retrieve_keys else 0
         cached_tensors_cover = self._retrieve_data_cache_covers(
@@ -2124,6 +2091,58 @@ class AscendLMCacheEngine(LMCacheEngine):
             required_chunks,
         )
         use_cached_retrieve = cached_tensors_cover or cached_memory_objs_cover
+        kwargs["_use_cached_retrieve"] = use_cached_retrieve
+
+        if _dsa_debug_should_log(self, "head_retrieve_metadata"):
+            slot_mapping = kwargs.get("slot_mapping")
+            min_tensor_chunks = self._min_layer_cache_chunks(
+                cached_tensors, self.num_layers
+            )
+            min_mem_chunks = self._min_layer_cache_chunks(
+                cached_memory_objs, self.num_layers
+            )
+            min_ptr_chunks = self._min_layer_cache_chunks(
+                cached_chunk_ptrs_npu, self.num_layers
+            )
+            logger.warning(
+                "[DSA_SHRINK_CHECK] lmcache_ascend_head_retrieve "
+                "req=%s num_tokens=%s mask_shape=%s mask_minmax_count=%s "
+                "ret_mask_shape=%s ret_mask_minmax_count=%s slot_mapping_shape=%s "
+                "slot_mapping_sample=%s slot_mapping_minmax_count=%s "
+                "vllm_cached=%s lmcache_cached=%s metadata_warm=%s "
+                "use_cached_retrieve=%s required_chunks=%s "
+                "min_tensor_chunks=%s min_mem_chunks=%s min_ptr_chunks=%s "
+                "cached_tensors_layers=%s cached_mem_layers=%s "
+                "cached_chunk_ptr_layers=%s retrieve_key_groups=%s "
+                "first_layer_chunks=%s starts_sample=%s ends_sample=%s "
+                "location=%s",
+                kwargs.get("req_id"),
+                num_tokens,
+                _dsa_debug_shape(mask),
+                _dsa_debug_minmax_count(mask),
+                _dsa_debug_shape(ret_mask),
+                _dsa_debug_minmax_count(ret_mask),
+                _dsa_debug_shape(slot_mapping),
+                _dsa_debug_sample(slot_mapping),
+                _dsa_debug_minmax_count(slot_mapping),
+                kwargs.get("vllm_cached_tokens"),
+                kwargs.get("lmcache_cached_tokens"),
+                metadata_warm,
+                use_cached_retrieve,
+                required_chunks,
+                min_tensor_chunks,
+                min_mem_chunks,
+                min_ptr_chunks,
+                len(cached_tensors) if cached_tensors is not None else None,
+                len(cached_memory_objs) if cached_memory_objs is not None else None,
+                len(cached_chunk_ptrs_npu)
+                if cached_chunk_ptrs_npu is not None else None,
+                len(retrieve_keys) if retrieve_keys is not None else None,
+                len(retrieve_keys[0]) if retrieve_keys else 0,
+                _dsa_debug_sample(starts),
+                _dsa_debug_sample(ends),
+                location,
+            )
         if has_cached_retrieve_data and required_chunks and not use_cached_retrieve:
             raise ValueError(
                 "Layerwise sparse retrieve cache is incomplete; refusing to "
@@ -2148,6 +2167,27 @@ class AscendLMCacheEngine(LMCacheEngine):
             and not shared_retrieve_passive
             and not cached_shared_handles_cover
         )
+
+        if _DSA_PROF:
+            min_handles_chunks = self._min_layer_cache_chunks(
+                cached_shared_handles, self.num_layers
+            )
+            print(
+                f"[RETRIEVE_DECISION] req={kwargs.get('req_id')} "
+                f"kv_group={kv_group} num_tokens={num_tokens} "
+                f"lmcache_cached={kwargs.get('lmcache_cached_tokens')} "
+                f"required_chunks={required_chunks} "
+                f"use_cached_retrieve={use_cached_retrieve} "
+                f"shared_sparse={shared_sparse_retrieve} "
+                f"shared_passive={shared_retrieve_passive} "
+                f"publish_handles={publish_shared_handles} "
+                f"min_tensor_chunks={self._min_layer_cache_chunks(cached_tensors, self.num_layers)} "
+                f"min_mem_chunks={self._min_layer_cache_chunks(cached_memory_objs, self.num_layers)} "
+                f"min_ptr_chunks={self._min_layer_cache_chunks(cached_chunk_ptrs_npu, self.num_layers)} "
+                f"min_handles_chunks={min_handles_chunks} "
+                f"location={location}",
+                flush=True,
+            )
 
         if use_cached_retrieve:
             location = self._resolve_local_cpu_retrieve_location(location)
