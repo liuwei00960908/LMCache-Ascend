@@ -80,6 +80,12 @@ _sparse_direct_prof_acc: dict[str, float] = {}
 _sparse_direct_prof_count = 0
 _sparse_direct_prof_state_hits = 0
 _sparse_direct_prof_state_misses = 0
+_sparse_pack_prof_acc: dict[str, float] = {}
+_sparse_pack_prof_meta: dict[str, int] = {}
+_sparse_pack_prof_count = 0
+_sparse_state_prof_acc: dict[str, float] = {}
+_sparse_state_prof_meta: dict[str, int] = {}
+_sparse_state_prof_count = 0
 
 
 def _sparse_direct_prof_begin() -> float:
@@ -126,6 +132,84 @@ def _sparse_direct_prof_step() -> None:
     _sparse_direct_prof_acc = {}
     _sparse_direct_prof_state_hits = 0
     _sparse_direct_prof_state_misses = 0
+
+
+def _sparse_pack_prof_begin() -> float:
+    if not _DSA_PROF:
+        return 0.0
+    return time.perf_counter()
+
+
+def _sparse_pack_prof_add(name: str, start: float) -> None:
+    if not _DSA_PROF or start == 0.0:
+        return
+    _sparse_pack_prof_acc[name] = _sparse_pack_prof_acc.get(name, 0.0) + (
+        time.perf_counter() - start
+    ) * 1000.0
+
+
+def _sparse_pack_prof_inc(name: str, amount: int = 1) -> None:
+    if not _DSA_PROF:
+        return
+    _sparse_pack_prof_meta[name] = _sparse_pack_prof_meta.get(name, 0) + amount
+
+
+def _sparse_pack_prof_step() -> None:
+    if not _DSA_PROF:
+        return
+    global _sparse_pack_prof_count, _sparse_pack_prof_acc, _sparse_pack_prof_meta
+    _sparse_pack_prof_count += 1
+    if _sparse_pack_prof_count < _DSA_PROF_LAYERS:
+        return
+    meta = [f"{key}={value}" for key, value in sorted(_sparse_pack_prof_meta.items())]
+    parts = [f"{key}={value:.2f}ms" for key, value in _sparse_pack_prof_acc.items()]
+    print(
+        f"[SPARSE_PACK_PROF] calls={_sparse_pack_prof_count} "
+        + " ".join(meta + parts),
+        flush=True,
+    )
+    _sparse_pack_prof_count = 0
+    _sparse_pack_prof_acc = {}
+    _sparse_pack_prof_meta = {}
+
+
+def _sparse_state_prof_begin() -> float:
+    if not _DSA_PROF:
+        return 0.0
+    return time.perf_counter()
+
+
+def _sparse_state_prof_add(name: str, start: float) -> None:
+    if not _DSA_PROF or start == 0.0:
+        return
+    _sparse_state_prof_acc[name] = _sparse_state_prof_acc.get(name, 0.0) + (
+        time.perf_counter() - start
+    ) * 1000.0
+
+
+def _sparse_state_prof_inc(name: str, amount: int = 1) -> None:
+    if not _DSA_PROF:
+        return
+    _sparse_state_prof_meta[name] = _sparse_state_prof_meta.get(name, 0) + amount
+
+
+def _sparse_state_prof_step() -> None:
+    if not _DSA_PROF:
+        return
+    global _sparse_state_prof_count, _sparse_state_prof_acc, _sparse_state_prof_meta
+    _sparse_state_prof_count += 1
+    if _sparse_state_prof_count < _DSA_PROF_LAYERS:
+        return
+    meta = [f"{key}={value}" for key, value in sorted(_sparse_state_prof_meta.items())]
+    parts = [f"{key}={value:.2f}ms" for key, value in _sparse_state_prof_acc.items()]
+    print(
+        f"[SPARSE_STATE_PROF] calls={_sparse_state_prof_count} "
+        + " ".join(meta + parts),
+        flush=True,
+    )
+    _sparse_state_prof_count = 0
+    _sparse_state_prof_acc = {}
+    _sparse_state_prof_meta = {}
 
 
 def _dsa_prof_record_wait(ev_a, ev_b):
@@ -1447,6 +1531,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self._sparse_direct_layer_states: Optional[dict] = None
         self._sparse_direct_kvcaches_id: Optional[int] = None
         self._sparse_direct_validated_layers: set = set()
+        self._sparse_state_prof_prev: dict = {}
 
     def _reset_sparse_direct_layer_states(self) -> None:
         self._sparse_direct_layer_states = None
@@ -1792,6 +1877,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 layer_tensors, kv_group
             )
 
+        _prof_start = _sparse_state_prof_begin()
         state_key = self._sparse_direct_state_key(
             kvcaches_ref=kvcaches_ref,
             kv_group=kv_group,
@@ -1807,12 +1893,47 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
             source_signature=source_signature,
         )
+        _sparse_state_prof_add("key_build", _prof_start)
         assert state_key is not None
+
+        if _DSA_PROF:
+            vllm_layer_cache = kvcaches_ref[layer_id]
+            wrapper_signature = self._vllm_layer_cache_identity_signature(
+                vllm_layer_cache
+            )
+            tensor_signature = self._tensor_collection_identity_signature(
+                vllm_layer_cache
+            )
+            state_prof_key = (kv_group, layer_id)
+            current_prof_state = {
+                "wrapper": wrapper_signature,
+                "tensor": tensor_signature,
+                "source": source_signature,
+                "total_tokens": int(total_tokens),
+                "slot_numel": int(slot_mapping_ref.numel()),
+            }
+            prev_prof_state = self._sparse_state_prof_prev.get(state_prof_key)
+            if prev_prof_state is not None:
+                if prev_prof_state.get("wrapper") != wrapper_signature:
+                    _sparse_state_prof_inc("wrapper_changed")
+                if prev_prof_state.get("tensor") != tensor_signature:
+                    _sparse_state_prof_inc("tensor_ptr_changed")
+                if prev_prof_state.get("source") != source_signature:
+                    _sparse_state_prof_inc("source_sig_changed")
+                if prev_prof_state.get("total_tokens") != int(total_tokens):
+                    _sparse_state_prof_inc("total_tokens_changed")
+                if prev_prof_state.get("slot_numel") != int(slot_mapping_ref.numel()):
+                    _sparse_state_prof_inc("slot_numel_changed")
+            self._sparse_state_prof_prev[state_prof_key] = current_prof_state
+
         state = self._sparse_direct_layer_states.get(state_key)
         if state is not None:
             _sparse_direct_prof_state_hit(True)
+            _sparse_state_prof_inc("hits")
+            _sparse_state_prof_step()
             return (state, state_key) if return_key else state
         _sparse_direct_prof_state_hit(False)
+        _sparse_state_prof_inc("misses")
 
         vllm_layer_cache = kvcaches_ref[layer_id]
         vllm_tensor_count = (
@@ -1821,6 +1942,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             else 1
         )
 
+        _prof_start = _sparse_state_prof_begin()
         state = prepare_sparse_direct_layer_state(
             layer_tensors[0],
             kvcaches_ref[layer_id],
@@ -1833,7 +1955,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             sparse_dsa_hidden_dims,
             total_tokens,
         )
+        _sparse_state_prof_add("prepare_state", _prof_start)
         self._sparse_direct_layer_states[state_key] = state
+        _sparse_state_prof_step()
         return (state, state_key) if return_key else state
 
     def _pack_sparse_layer_inputs(
@@ -1847,26 +1971,61 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if selected_token_idx is not None and not isinstance(
             selected_token_idx, torch.Tensor
         ):
+            _sparse_pack_prof_inc("selected_from_list")
+            _prof_start = _sparse_pack_prof_begin()
             selected_token_idx = torch.tensor(
                 selected_token_idx, dtype=torch.int32, device=self.kv_device
             )
+            _sparse_pack_prof_add("selected_cast", _prof_start)
 
         debug_pack = _dsa_debug_should_log(self, "pack_sparse_layer_inputs")
-        input_selected_shape = _dsa_debug_shape(selected_token_idx)
-        input_selected_sample = _dsa_debug_sample(selected_token_idx)
-        input_selected_minmax = _dsa_debug_minmax_count(selected_token_idx)
+        input_selected_for_debug = selected_token_idx
 
         if target_slot_mapping is not None:
+            _sparse_pack_prof_inc("fallback_target_count")
             if not isinstance(target_slot_mapping, torch.Tensor):
+                _sparse_pack_prof_inc("target_from_list")
+                _prof_start = _sparse_pack_prof_begin()
                 target_slot_mapping = torch.tensor(
                     target_slot_mapping, dtype=torch.long, device=self.kv_device
                 )
-            slot_mapping_packed = target_slot_mapping.reshape(-1).to(
+                _sparse_pack_prof_add("target_cast", _prof_start)
+            elif (
+                target_slot_mapping.device != self.kv_device
+                or target_slot_mapping.dtype != torch.long
+            ):
+                _sparse_pack_prof_inc("target_needs_cast")
+            if (
+                isinstance(target_slot_mapping, torch.Tensor)
+                and not target_slot_mapping.is_contiguous()
+            ):
+                _sparse_pack_prof_inc("target_non_contig")
+            _prof_start = _sparse_pack_prof_begin()
+            target_slot_mapping = target_slot_mapping.reshape(-1)
+            _sparse_pack_prof_add("target_reshape", _prof_start)
+            _prof_start = _sparse_pack_prof_begin()
+            slot_mapping_packed = target_slot_mapping.to(
                 device=self.kv_device, dtype=torch.long
             )
+            _sparse_pack_prof_add("target_cast", _prof_start)
+            selected_needs_cast = (
+                selected_token_idx is None
+                or not isinstance(selected_token_idx, torch.Tensor)
+                or selected_token_idx.device != self.kv_device
+                or selected_token_idx.dtype != torch.int32
+            )
+            if selected_needs_cast:
+                _sparse_pack_prof_inc("selected_needs_cast")
+            elif (
+                isinstance(selected_token_idx, torch.Tensor)
+                and not selected_token_idx.is_contiguous()
+            ):
+                _sparse_pack_prof_inc("selected_non_contig")
+            _prof_start = _sparse_pack_prof_begin()
             selected_token_idx = self._sparse_selected_token_idx(
                 selected_token_idx, slot_mapping_packed.shape[0]
             )
+            _sparse_pack_prof_add("selected_cast", _prof_start)
             if selected_token_idx.numel() != slot_mapping_packed.numel():
                 raise ValueError(
                     "Sparse target_slot_mapping must match selected_token_idx "
@@ -1876,8 +2035,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             return slot_mapping_packed, selected_token_idx
 
         if selected_token_idx is not None and selected_token_idx.numel() > 0:
+            _sparse_pack_prof_inc("fallback_count")
             if selected_token_idx.dim() > 1:
+                _sparse_pack_prof_inc("fallback_rows")
+                _prof_start = _sparse_pack_prof_begin()
                 rows = selected_token_idx.reshape(selected_token_idx.shape[0], -1)
+                _sparse_pack_prof_add("selected_reshape", _prof_start)
                 starts = token_start_index
                 start_values = None
                 if isinstance(starts, int):
@@ -1916,6 +2079,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     )
                 if start_values is None:
                     row_width = int(rows.shape[1])
+                    _prof_start = _sparse_pack_prof_begin()
                     row_offsets = torch.arange(
                         row_width,
                         dtype=torch.long,
@@ -1926,14 +2090,26 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         + row_offsets.reshape(1, -1)
                     ).reshape(-1)
                     slot_mapping_packed = slot_mapping[gather_indices]
+                    _sparse_pack_prof_add("fallback_gather", _prof_start)
                     selected_token_idx = rows.reshape(-1)
+                    selected_needs_cast = (
+                        selected_token_idx.device != self.kv_device
+                        or selected_token_idx.dtype != torch.int32
+                    )
+                    if selected_needs_cast:
+                        _sparse_pack_prof_inc("selected_needs_cast")
+                    elif not selected_token_idx.is_contiguous():
+                        _sparse_pack_prof_inc("selected_non_contig")
+                    _prof_start = _sparse_pack_prof_begin()
                     selected_token_idx = self._sparse_selected_token_idx(
                         selected_token_idx, slot_mapping_packed.shape[0]
                     )
+                    _sparse_pack_prof_add("selected_cast", _prof_start)
                     return slot_mapping_packed, selected_token_idx
 
                 slot_chunks = []
                 selected_chunks = []
+                _prof_start = _sparse_pack_prof_begin()
                 for row_idx in range(rows.shape[0]):
                     row = rows[row_idx]
                     start = start_values[row_idx]
@@ -1946,6 +2122,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         )
                     slot_chunks.append(slot_mapping[start:end])
                     selected_chunks.append(row)
+                _sparse_pack_prof_add("fallback_slice", _prof_start)
+                _prof_start = _sparse_pack_prof_begin()
                 slot_mapping_packed = (
                     torch.cat(slot_chunks, dim=0)
                     if slot_chunks else slot_mapping[:0]
@@ -1954,9 +2132,20 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     torch.cat(selected_chunks, dim=0)
                     if selected_chunks else selected_token_idx.reshape(-1)[:0]
                 )
+                _sparse_pack_prof_add("fallback_cat", _prof_start)
+                selected_needs_cast = (
+                    selected_token_idx.device != self.kv_device
+                    or selected_token_idx.dtype != torch.int32
+                )
+                if selected_needs_cast:
+                    _sparse_pack_prof_inc("selected_needs_cast")
+                elif not selected_token_idx.is_contiguous():
+                    _sparse_pack_prof_inc("selected_non_contig")
+                _prof_start = _sparse_pack_prof_begin()
                 selected_token_idx = self._sparse_selected_token_idx(
                     selected_token_idx, slot_mapping_packed.shape[0]
                 )
+                _sparse_pack_prof_add("selected_cast", _prof_start)
                 return slot_mapping_packed, selected_token_idx
 
             num_sparse = int(selected_token_idx.numel())
@@ -1977,9 +2166,19 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 selected_token_idx = selected_token_idx[:0]
                 truncated = True
                 empty_due_to_start = True
+            selected_needs_cast = (
+                selected_token_idx.device != self.kv_device
+                or selected_token_idx.dtype != torch.int32
+            )
+            if selected_needs_cast:
+                _sparse_pack_prof_inc("selected_needs_cast")
+            elif not selected_token_idx.is_contiguous():
+                _sparse_pack_prof_inc("selected_non_contig")
+            _prof_start = _sparse_pack_prof_begin()
             selected_token_idx = self._sparse_selected_token_idx(
                 selected_token_idx, slot_mapping_packed.shape[0]
             )
+            _sparse_pack_prof_add("selected_cast", _prof_start)
             should_log_pack = debug_pack or (
                 truncated
                 and _dsa_debug_failure_should_log(
@@ -1987,6 +2186,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
             )
             if should_log_pack:
+                input_selected_shape = _dsa_debug_shape(input_selected_for_debug)
+                input_selected_sample = _dsa_debug_sample(input_selected_for_debug)
+                input_selected_minmax = _dsa_debug_minmax_count(
+                    input_selected_for_debug
+                )
                 log_fn = logger.error if truncated else logger.warning
                 log_fn(
                     "[DSA_SHRINK_CHECK] npu_pack_sparse "
@@ -2024,10 +2228,17 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if token_start_index == 0
             else slot_mapping[int(token_start_index) :]
         )
+        _sparse_pack_prof_inc("fallback_full_count")
+        _sparse_pack_prof_inc("selected_needs_cast")
+        _prof_start = _sparse_pack_prof_begin()
         selected_token_idx = self._sparse_selected_token_idx(
             None, slot_mapping_packed.shape[0]
         )
+        _sparse_pack_prof_add("selected_cast", _prof_start)
         if debug_pack:
+            input_selected_shape = _dsa_debug_shape(selected_token_idx)
+            input_selected_sample = _dsa_debug_sample(selected_token_idx)
+            input_selected_minmax = _dsa_debug_minmax_count(selected_token_idx)
             logger.warning(
                 "[DSA_SHRINK_CHECK] npu_pack_sparse "
                 "slot_mapping_shape=%s slot_mapping_sample=%s "
@@ -2065,29 +2276,59 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         target_slot_mapping: Union[torch.Tensor, list],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Use caller-provided target slots for row-wise MTP sparse loads."""
+        _sparse_pack_prof_inc("explicit_count")
         if selected_token_idx is None:
             selected_token_idx = []
         if not isinstance(selected_token_idx, torch.Tensor):
+            _sparse_pack_prof_inc("selected_from_list")
+            _prof_start = _sparse_pack_prof_begin()
             selected_token_idx = torch.tensor(
                 selected_token_idx, dtype=torch.int32, device=self.kv_device
             )
+            _sparse_pack_prof_add("selected_cast", _prof_start)
+        elif (
+            selected_token_idx.device != self.kv_device
+            or selected_token_idx.dtype != torch.int32
+        ):
+            _sparse_pack_prof_inc("selected_needs_cast")
+        elif not selected_token_idx.is_contiguous():
+            _sparse_pack_prof_inc("selected_non_contig")
+        _prof_start = _sparse_pack_prof_begin()
         selected_token_idx = selected_token_idx.reshape(-1)
+        _sparse_pack_prof_add("selected_reshape", _prof_start)
 
         if not isinstance(target_slot_mapping, torch.Tensor):
+            _sparse_pack_prof_inc("target_from_list")
+            _prof_start = _sparse_pack_prof_begin()
             target_slot_mapping = torch.tensor(
                 target_slot_mapping, dtype=torch.long, device=self.kv_device
             )
-        target_slot_mapping = target_slot_mapping.reshape(-1).to(
+            _sparse_pack_prof_add("target_cast", _prof_start)
+        elif (
+            target_slot_mapping.device != self.kv_device
+            or target_slot_mapping.dtype != torch.long
+        ):
+            _sparse_pack_prof_inc("target_needs_cast")
+        elif not target_slot_mapping.is_contiguous():
+            _sparse_pack_prof_inc("target_non_contig")
+        _prof_start = _sparse_pack_prof_begin()
+        target_slot_mapping = target_slot_mapping.reshape(-1)
+        _sparse_pack_prof_add("target_reshape", _prof_start)
+        _prof_start = _sparse_pack_prof_begin()
+        target_slot_mapping = target_slot_mapping.to(
             device=self.kv_device, dtype=torch.long
         )
+        _sparse_pack_prof_add("target_cast", _prof_start)
         if int(target_slot_mapping.numel()) != int(selected_token_idx.numel()):
             raise ValueError(
                 "target_slot_mapping and selected_token_idx must have the same "
                 f"length: {target_slot_mapping.numel()} vs {selected_token_idx.numel()}"
             )
+        _prof_start = _sparse_pack_prof_begin()
         selected_token_idx = self._sparse_selected_token_idx(
             selected_token_idx, target_slot_mapping.shape[0]
         )
+        _sparse_pack_prof_add("selected_cast", _prof_start)
         return target_slot_mapping, selected_token_idx
 
     def _kv_cache_token_capacity(
@@ -3847,14 +4088,17 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
             payload_events = _payload_event_list(payload_event)
             _prof_start = _sparse_direct_prof_begin()
+            _pack_prof_total = _sparse_pack_prof_begin()
             with self._stream_context_or_null(current_stream):
                 # selected_token_idx/target_slot_mapping may be device tensors
                 # produced by vLLM's remap path. Packing below is their first
                 # connector-side consumer, so wait before packing, not only
                 # later inside the load-stream transfer.
+                _pack_prof_wait = _sparse_pack_prof_begin()
                 if payload_events:
                     for event in payload_events:
                         current_stream.wait_event(event)
+                _sparse_pack_prof_add("payload_wait", _pack_prof_wait)
 
                 if explicit_sparse_payload:
                     slot_mapping_packed, selected_token_idx = (
@@ -3872,6 +4116,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         )
                     )
             _sparse_direct_prof_add("pack_inputs", _prof_start)
+            _sparse_pack_prof_add("total", _pack_prof_total)
+            _sparse_pack_prof_step()
 
             # Payload producer events are consumed before packing on
             # current_stream. The transfer stream waits on current_stream below,
