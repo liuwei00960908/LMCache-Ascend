@@ -2,6 +2,7 @@
 # Standard
 from contextlib import nullcontext
 import os
+import time
 from typing import Any, List, Optional, Set, Union
 
 # Third Party
@@ -75,6 +76,56 @@ _DSA_PROF = os.getenv("VLLM_ASCEND_DSA_PROF", "0") == "1"
 _DSA_PROF_LAYERS = int(os.getenv("VLLM_ASCEND_DSA_PROF_LAYERS", "61"))
 _dsa_prof_wait_events: list = []
 _dsa_prof_wait_count = 0
+_sparse_direct_prof_acc: dict[str, float] = {}
+_sparse_direct_prof_count = 0
+_sparse_direct_prof_state_hits = 0
+_sparse_direct_prof_state_misses = 0
+
+
+def _sparse_direct_prof_begin() -> float:
+    if not _DSA_PROF:
+        return 0.0
+    return time.perf_counter()
+
+
+def _sparse_direct_prof_add(name: str, start: float) -> None:
+    if not _DSA_PROF or start == 0.0:
+        return
+    _sparse_direct_prof_acc[name] = _sparse_direct_prof_acc.get(name, 0.0) + (
+        time.perf_counter() - start
+    ) * 1000.0
+
+
+def _sparse_direct_prof_state_hit(hit: bool) -> None:
+    if not _DSA_PROF:
+        return
+    global _sparse_direct_prof_state_hits, _sparse_direct_prof_state_misses
+    if hit:
+        _sparse_direct_prof_state_hits += 1
+    else:
+        _sparse_direct_prof_state_misses += 1
+
+
+def _sparse_direct_prof_step() -> None:
+    if not _DSA_PROF:
+        return
+    global _sparse_direct_prof_count, _sparse_direct_prof_acc
+    global _sparse_direct_prof_state_hits, _sparse_direct_prof_state_misses
+    _sparse_direct_prof_count += 1
+    if _sparse_direct_prof_count < _DSA_PROF_LAYERS:
+        return
+    parts = [f"{key}={value:.2f}ms" for key, value in _sparse_direct_prof_acc.items()]
+    print(
+        f"[SPARSE_DIRECT_PROF] calls={_sparse_direct_prof_count} "
+        f"state_hits={_sparse_direct_prof_state_hits} "
+        f"state_misses={_sparse_direct_prof_state_misses} "
+        + " ".join(parts),
+        flush=True,
+    )
+    _sparse_direct_prof_count = 0
+    _sparse_direct_prof_acc = {}
+    _sparse_direct_prof_state_hits = 0
+    _sparse_direct_prof_state_misses = 0
 
 
 def _dsa_prof_record_wait(ev_a, ev_b):
@@ -1759,7 +1810,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         assert state_key is not None
         state = self._sparse_direct_layer_states.get(state_key)
         if state is not None:
+            _sparse_direct_prof_state_hit(True)
             return (state, state_key) if return_key else state
+        _sparse_direct_prof_state_hit(False)
 
         vllm_layer_cache = kvcaches_ref[layer_id]
         vllm_tensor_count = (
@@ -2311,6 +2364,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         payload_event: Optional[Any] = None,
         explicit_sparse_payload: bool = False,
     ) -> None:
+        _prof_total = _sparse_direct_prof_begin()
         num_sparse = int(selected_token_idx.numel())
         debug_run = _dsa_debug_should_log(self, "run_sparse_direct_layer")
         if debug_run:
@@ -2337,6 +2391,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             )
         if num_sparse == 0 or total_tokens <= 0 or chunk_ptrs_npu.numel() == 0:
             return
+        _prof_start = _sparse_direct_prof_begin()
         chunk_count = int(chunk_ptrs_npu.numel())
         chunk_size_int = int(chunk_size)
         covered_tokens = chunk_count * chunk_size_int
@@ -2364,8 +2419,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
                 logger.error(message)
                 raise ValueError(message)
+        _sparse_direct_prof_add("guard", _prof_start)
 
         if _SPARSE_DIRECT_RECORD_STREAM:
+            _prof_start = _sparse_direct_prof_begin()
             for tensor in (slot_mapping_packed, selected_token_idx, chunk_ptrs_npu):
                 try:
                     tensor.record_stream(load_stream)
@@ -2373,7 +2430,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     # Some backends/tensor types may not support record_stream.
                     # The transfer still has explicit stream ordering below.
                     pass
+            _sparse_direct_prof_add("record_stream", _prof_start)
 
+        _prof_start = _sparse_direct_prof_begin()
         resolve_tensors = (
             layer_tensors
             if layer_tensors is not None
@@ -2397,7 +2456,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             sparse_v_hidden_dims=sparse_v_hidden_dims,
             sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
         )
+        _sparse_direct_prof_add("state_key", _prof_start)
 
+        _prof_start = _sparse_direct_prof_begin()
         layer_state, validate_key = self._get_or_create_sparse_direct_layer_state(
             kvcaches_ref=kvcaches_ref,
             kv_group=kv_group,
@@ -2414,15 +2475,19 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             source_signature=runtime_source_signature,
             return_key=True,
         )
+        _sparse_direct_prof_add("get_or_create_state", _prof_start)
         if validate_key is None:
             validate_key = (kv_group, layer_id)
         with torch.cuda.stream(load_stream):
+            _prof_start = _sparse_direct_prof_begin()
             load_stream.wait_stream(current_stream)
             payload_events = _payload_event_list(payload_event)
             if payload_events:
                 for event in payload_events:
                     load_stream.wait_event(event)
+            _sparse_direct_prof_add("stream_wait_before", _prof_start)
             if explicit_sparse_payload and _SPARSE_DIRECT_GUARD:
+                _prof_start = _sparse_direct_prof_begin()
                 self._validate_sparse_direct_explicit_inputs(
                     kvcaches_ref=kvcaches_ref,
                     kv_group=kv_group,
@@ -2433,10 +2498,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     total_tokens=total_tokens,
                     chunk_ptrs_npu=chunk_ptrs_npu,
                 )
+                _sparse_direct_prof_add("validate_explicit", _prof_start)
             if layer_state is not None:
                 validate_inputs = (
                     validate_key not in self._sparse_direct_validated_layers
                 )
+                _prof_start = _sparse_direct_prof_begin()
                 sparse_mla_dsa_batched_direct_kv_transfer_fast(
                     layer_state,
                     slot_mapping_packed,
@@ -2447,6 +2514,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     sparse_host_interleaved,
                     validate_inputs,
                 )
+                _sparse_direct_prof_add("kernel_submit", _prof_start)
                 if validate_inputs:
                     self._sparse_direct_validated_layers.add(validate_key)
             else:
@@ -2457,6 +2525,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         "layer=%s path=direct validate_inputs=None",
                         layer_id,
                     )
+                _prof_start = _sparse_direct_prof_begin()
                 sparse_mla_dsa_batched_direct_kv_transfer(
                     cpu_tensors,
                     kvcaches_ref[layer_id],
@@ -2473,15 +2542,19 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     sparse_host_interleaved,
                     chunk_ptrs_npu,
                 )
+                _sparse_direct_prof_add("kernel_submit", _prof_start)
 
         if _DSA_PROF:
             _ev_a = torch.npu.Event(enable_timing=True)
             _ev_b = torch.npu.Event(enable_timing=True)
             _ev_a.record()
+        _prof_start = _sparse_direct_prof_begin()
         current_stream.wait_stream(load_stream)
+        _sparse_direct_prof_add("stream_wait_after_host", _prof_start)
         if _DSA_PROF:
             _ev_b.record()
             _dsa_prof_record_wait(_ev_a, _ev_b)
+        _sparse_direct_prof_add("total", _prof_total)
 
     def _sparse_selected_token_idx(
         self,
@@ -3773,6 +3846,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 token_start_index = 0
 
             payload_events = _payload_event_list(payload_event)
+            _prof_start = _sparse_direct_prof_begin()
             with self._stream_context_or_null(current_stream):
                 # selected_token_idx/target_slot_mapping may be device tensors
                 # produced by vLLM's remap path. Packing below is their first
@@ -3797,12 +3871,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             token_start_index,
                         )
                     )
+            _sparse_direct_prof_add("pack_inputs", _prof_start)
 
             # Payload producer events are consumed before packing on
             # current_stream. The transfer stream waits on current_stream below,
             # so re-waiting on the same payload events is redundant here.
             transfer_payload_event = None
 
+            _prof_start = _sparse_direct_prof_begin()
             layer_cached_tensors = (
                 cached_tensors_by_layer[layer_id]
                 if cached_tensors_by_layer is not None
@@ -3818,6 +3894,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     for memory_obj in memory_objs_layer
                     if memory_obj.tensor is not None
                 ]
+            _sparse_direct_prof_add("resolve_cpu_tensors", _prof_start)
 
             if not cpu_tensors:
                 if _dsa_debug_failure_should_log(
@@ -3837,12 +3914,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     )
                 continue
 
+            _prof_start = _sparse_direct_prof_begin()
             chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
                 layer_id,
                 cpu_tensors,
                 cached_chunk_ptrs_npu,
                 cached_chunk_dev_ptrs,
             )
+            _sparse_direct_prof_add("resolve_chunk_ptrs", _prof_start)
+            _prof_start = _sparse_direct_prof_begin()
             physical_total_tokens = self._sparse_total_tokens_from_layer_chunks(
                 cpu_tensors, kv_group
             )
@@ -3851,6 +3931,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 if lmcache_cached_tokens > 0
                 else physical_total_tokens
             )
+            _sparse_direct_prof_add("total_tokens", _prof_start)
 
             if _DSA_PROF and layer_id == 0:
                 chunk_count = int(chunk_ptrs_npu.numel())
@@ -3924,6 +4005,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     payload_event=transfer_payload_event,
                     explicit_sparse_payload=explicit_sparse_payload,
                 )
+
+            _sparse_direct_prof_step()
 
         yield
 

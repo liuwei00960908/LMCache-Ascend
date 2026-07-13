@@ -34,6 +34,40 @@ import torch
 logger = init_logger(__name__)
 
 _DSA_PROF = os.getenv("VLLM_ASCEND_DSA_PROF", "0") == "1"
+_DSA_PROF_LAYERS = int(os.getenv("VLLM_ASCEND_DSA_PROF_LAYERS", "61"))
+_retrieve_hot_prof_acc: dict[str, float] = {}
+_retrieve_hot_prof_count = 0
+
+
+def _retrieve_hot_prof_begin() -> float:
+    if not _DSA_PROF:
+        return 0.0
+    return time.perf_counter()
+
+
+def _retrieve_hot_prof_add(name: str, start: float) -> None:
+    if not _DSA_PROF or start == 0.0:
+        return
+    _retrieve_hot_prof_acc[name] = _retrieve_hot_prof_acc.get(name, 0.0) + (
+        time.perf_counter() - start
+    ) * 1000.0
+
+
+def _retrieve_hot_prof_step() -> None:
+    if not _DSA_PROF:
+        return
+    global _retrieve_hot_prof_count, _retrieve_hot_prof_acc
+    _retrieve_hot_prof_count += 1
+    if _retrieve_hot_prof_count < _DSA_PROF_LAYERS:
+        return
+    parts = [f"{key}={value:.2f}ms" for key, value in _retrieve_hot_prof_acc.items()]
+    print(
+        f"[RETRIEVE_HOT_PROF] calls={_retrieve_hot_prof_count} "
+        + " ".join(parts),
+        flush=True,
+    )
+    _retrieve_hot_prof_count = 0
+    _retrieve_hot_prof_acc = {}
 
 LOCAL_CPU_BACKEND_NAME = "LocalCPUBackend"
 
@@ -2067,6 +2101,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             self.num_layers,
         )
 
+        _prof_start = _retrieve_hot_prof_begin()
         location, starts, ends, retrieve_keys = self._ensure_retrieve_chunk_metadata(
             tokens=tokens,
             mask=mask,
@@ -2077,8 +2112,10 @@ class AscendLMCacheEngine(LMCacheEngine):
             ret_mask=ret_mask,
             retrieve_kwargs=kwargs,
         )
+        _retrieve_hot_prof_add("metadata", _prof_start)
         kwargs.pop("_use_cached_retrieve", None)
 
+        _prof_start = _retrieve_hot_prof_begin()
         required_chunks = len(retrieve_keys[0]) if retrieve_keys else 0
         cached_tensors_cover = self._retrieve_data_cache_covers(
             cached_tensors,
@@ -2092,6 +2129,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
         use_cached_retrieve = cached_tensors_cover or cached_memory_objs_cover
         kwargs["_use_cached_retrieve"] = use_cached_retrieve
+        _retrieve_hot_prof_add("coverage_check", _prof_start)
 
         if _dsa_debug_should_log(self, "head_retrieve_metadata"):
             slot_mapping = kwargs.get("slot_mapping")
@@ -2304,6 +2342,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 },
             )
 
+        _prof_start = _retrieve_hot_prof_begin()
         if shared_sparse_retrieve and not use_cached_retrieve and retrieve_keys:
             missing_locations: list[tuple[int, int]] = []
             for layer_id, layer_keys in enumerate(retrieve_keys):
@@ -2429,6 +2468,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 f"{request_preflight_state.get('source_kv_group')}, "
                 f"message={request_preflight_state.get('message')}"
             )
+        _retrieve_hot_prof_add("shared_preflight", _prof_start)
 
         if preflight_error_envelope is not None:
             yield ret_mask
@@ -2539,6 +2579,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             nonlocal mem_obj_consumer, sparse_memory_objs_notified
             if mem_obj_consumer is not None:
                 return mem_obj_consumer
+            _prof_start = _retrieve_hot_prof_begin()
             mem_obj_consumer = (
                 self.gpu_connector.batched_to_gpu_head_token_wise(**kwargs)
             )
@@ -2555,6 +2596,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 notify_fn()
                 sparse_memory_objs_notified = True
             next(mem_obj_consumer)
+            _retrieve_hot_prof_add("connector_start", _prof_start)
             return mem_obj_consumer
 
         try:
@@ -2596,6 +2638,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                         f"message={request_preflight_state.get('message')}"
                     )
 
+                _prof_start = _retrieve_hot_prof_begin()
                 if cached_mem_layers is not None:
                     mem_objs_layer = cached_mem_layers[layer_id]
                     diag_source = "cached_memory_objs"
@@ -2635,8 +2678,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 )
                     else:
                         mem_objs_layer = []
+                _retrieve_hot_prof_add("source_select", _prof_start)
 
                 if publish_shared_handles:
+                    _prof_start = _retrieve_hot_prof_begin()
                     if required_chunks and not mem_objs_layer:
                         message = (
                             "Shared CPU sparse decode has no MemoryObjs to "
@@ -2723,11 +2768,15 @@ class AscendLMCacheEngine(LMCacheEngine):
                             )
                         raise
                     self._broadcast_shared_envelope(envelope)
+                    _retrieve_hot_prof_add("publish_handles", _prof_start)
 
                 if sparse_payload is not None:
                     sparse_payload["memory_objs_layer"] = mem_objs_layer
+                    _prof_start = _retrieve_hot_prof_begin()
                     ensure_mem_obj_consumer().send(sparse_payload)
+                    _retrieve_hot_prof_add("send_connector", _prof_start)
                 else:
+                    _prof_start = _retrieve_hot_prof_begin()
                     ensure_mem_obj_consumer().send(
                         (
                             mem_objs_layer,
@@ -2736,9 +2785,14 @@ class AscendLMCacheEngine(LMCacheEngine):
                             target_slot_mapping,
                         )
                     )
+                    _retrieve_hot_prof_add("send_connector", _prof_start)
+
+                _retrieve_hot_prof_step()
 
             if mem_obj_consumer is not None:
+                _prof_start = _retrieve_hot_prof_begin()
                 next(mem_obj_consumer)
+                _retrieve_hot_prof_add("connector_finish", _prof_start)
             release_pending_pre_resolved()
             # The LMCache vLLM adapter records request state after this final
             # yield and drains sparse retrievers with close(), so ownership must
