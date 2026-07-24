@@ -101,3 +101,40 @@ def test_dense_store_prepares_sparse_pointer_cache_without_shared_cpu() -> None:
     assert calls[0][1][0] is tensor
     assert calls[0][2] is cached_chunk_dev_ptrs
     assert calls[0][3] is cached_chunk_ptrs_npu
+
+
+def test_prepared_sparse_batch_capabilities_forward_to_connector() -> None:
+    engine = object.__new__(AscendLMCacheEngine)
+    calls = []
+    handle = object()
+    engine.gpu_connector = SimpleNamespace(
+        prepare_sparse_retrieve_batch=lambda groups: calls.append(("prepare", groups))
+        or handle,
+        retrieve_prepared_sparse_batch_layer=lambda *args: calls.append(
+            ("retrieve", args)
+        ),
+        close_sparse_retrieve_batch=lambda value: calls.append(("close", value)),
+    )
+    groups = {0: []}
+    selected = torch.zeros((1, 2), dtype=torch.int32)
+    targets = torch.zeros((1, 2), dtype=torch.long)
+    payload_event = object()
+
+    assert engine.prepare_sparse_retrieve_batch(groups) is handle
+    engine.retrieve_prepared_sparse_batch_layer(
+        handle, 0, 1, selected, targets, ["req"], payload_event
+    )
+    engine.close_sparse_retrieve_batch(handle)
+
+    assert calls[0] == ("prepare", groups)
+    assert calls[1][0] == "retrieve"
+    assert calls[1][1] == (
+        handle,
+        0,
+        1,
+        selected,
+        targets,
+        ["req"],
+        payload_event,
+    )
+    assert calls[2] == ("close", handle)

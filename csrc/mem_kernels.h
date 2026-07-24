@@ -137,6 +137,21 @@ void single_layer_kv_transfer_kernel_v2_mla_dsa_sparse_multi_chunk(
     const int32_t totalTokens, const int32_t blockSize,
     const bool lmcHostInterleaved = false);
 
+void single_layer_kv_transfer_kernel_v2_mla_dsa_sparse_multi_request(
+    kvcache_ops::AscendType type, kvcache_ops::AscendType slotType,
+    kvcache_ops::KVCacheFormat format, uint32_t blockDim, void *stream,
+    uint8_t *requestLayerPtrs, uint8_t *requestNumChunks,
+    uint8_t *requestTotalTokens, uint8_t *rowRequestLanes,
+    uint8_t *vllmKeyPtr, uint8_t *vllmValuePtr, uint8_t *vllmDsaPtr,
+    uint8_t *slotMappingPtr, uint8_t *selectedTokenIdxPtr,
+    const int64_t vllmKeyBufferSize, const int64_t vllmValueBufferSize,
+    const int64_t vllmDsaBufferSize, const int32_t maxTokensPerLoop,
+    const int64_t kHiddenDims, const int64_t vHiddenDims,
+    const int64_t dsaHiddenDims, const int32_t numTokens,
+    const int32_t rowWidth, const int32_t numRequests,
+    const int32_t layerId, const int32_t numLayers, const int32_t chunkSize,
+    const int32_t blockSize, const bool lmcHostInterleaved = false);
+
 void single_layer_kv_transfer_kernel_v2_mla_dsa_dense_multi_chunk(
     kvcache_ops::AscendType type, kvcache_ops::AscendType slotType,
     kvcache_ops::KVCacheFormat format, uint32_t blockDim, void *stream,
@@ -258,6 +273,14 @@ void sparse_mla_dsa_batched_direct_kv_transfer_prepared(
     torch::Tensor &slot_mapping_packed, torch::Tensor &selected_token_idx,
     torch::Tensor &chunk_ptrs_npu, const int64_t chunk_size,
     const int64_t total_tokens, const bool lmc_host_interleaved);
+
+void sparse_mla_dsa_multi_request_direct_kv_transfer_prepared(
+    const SparseDirectDestinationState &destination_state,
+    torch::Tensor &slot_mapping_packed, torch::Tensor &selected_token_idx,
+    torch::Tensor &row_request_lanes, torch::Tensor &request_layer_ptrs,
+    torch::Tensor &request_num_chunks, torch::Tensor &request_total_tokens,
+    const int64_t layer_id, const int64_t num_layers, const int64_t row_width,
+    const int64_t chunk_size, const bool lmc_host_interleaved);
 
 // Dense MLA/DSA direct transfer between CPU pinned chunks and paged KV.
 // direction=false: host chunks -> paged KV; direction=true: paged KV -> host chunks.

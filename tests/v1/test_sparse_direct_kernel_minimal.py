@@ -178,6 +178,132 @@ def test_mla_sparse_multi_chunk_direct_kernel_writes_selected_tokens() -> None:
         allocator.close()
 
 
+def test_mla_multi_request_direct_kernel_uses_request_sources() -> None:
+    """One launch must read request-local token IDs from distinct sources."""
+    _add_benchmark_helpers_to_path()
+    try:
+        from torch_npu.contrib import transfer_to_npu  # noqa: F401
+    except ImportError:
+        pass
+
+    from lmcache.v1.memory_management import PinMemoryAllocator
+    from load_benchmark_utils import (
+        KV_FORMAT_MLA,
+        build_chunk_ptrs_npu,
+        ensure_ascend_host_memory_registered,
+    )
+    from lmcache_ascend.v1.npu_connector.utils import (
+        prepare_sparse_direct_destination_state,
+        sparse_mla_dsa_multi_request_direct_kv_transfer_prepared,
+    )
+
+    ensure_ascend_host_memory_registered()
+    device = torch.device("npu")
+    dtype = torch.bfloat16
+    chunk_size = 4
+    block_size = 16
+    k_hidden_dims = 512
+    v_hidden_dims = 128
+    selected_rows = [[0, 3], [1, 2]]
+    target_rows = [[0, 1], [2, 3]]
+
+    allocator = PinMemoryAllocator(64 * 1024 * 1024)
+    mem_objs = []
+    request_chunks = []
+    try:
+        for request_lane in range(2):
+            mem_obj = allocator.allocate(
+                torch.Size([chunk_size * (k_hidden_dims + v_hidden_dims)]),
+                dtype,
+            )
+            assert mem_obj is not None and mem_obj.tensor is not None
+            mem_objs.append(mem_obj)
+            chunk = mem_obj.tensor
+            request_chunks.append([chunk])
+            k_plane = chunk[: chunk_size * k_hidden_dims].reshape(
+                chunk_size, k_hidden_dims
+            )
+            v_plane = chunk[chunk_size * k_hidden_dims :].reshape(
+                chunk_size, v_hidden_dims
+            )
+            for token in range(chunk_size):
+                value = request_lane * 100 + token
+                k_plane[token].fill_(float(value + 1))
+                v_plane[token].fill_(float(value + 1001))
+
+        k_dst = torch.full(
+            (1, block_size, 1, k_hidden_dims),
+            -7.0,
+            dtype=dtype,
+            device=device,
+        )
+        v_dst = torch.full(
+            (1, block_size, 1, v_hidden_dims),
+            -7.0,
+            dtype=dtype,
+            device=device,
+        )
+        selected = torch.tensor(selected_rows, dtype=torch.int32, device=device)
+        targets = torch.tensor(target_rows, dtype=torch.long, device=device)
+        row_lanes = torch.tensor([0, 1], dtype=torch.int32, device=device)
+
+        chunk_tables = [
+            build_chunk_ptrs_npu(chunks, device) for chunks in request_chunks
+        ]
+        layer_tables = [
+            torch.tensor([table.data_ptr()], dtype=torch.long, device=device)
+            for table in chunk_tables
+        ]
+        request_layer_ptrs = torch.tensor(
+            [table.data_ptr() for table in layer_tables],
+            dtype=torch.long,
+            device=device,
+        )
+        request_num_chunks = torch.tensor(
+            [1, 1], dtype=torch.int32, device=device
+        )
+        request_total_tokens = torch.tensor(
+            [chunk_size, chunk_size], dtype=torch.int32, device=device
+        )
+        destination_state = prepare_sparse_direct_destination_state(
+            [k_dst, v_dst],
+            targets,
+            KV_FORMAT_MLA,
+            k_hidden_dims,
+            v_hidden_dims,
+            0,
+        )
+
+        sparse_mla_dsa_multi_request_direct_kv_transfer_prepared(
+            destination_state,
+            targets,
+            selected,
+            row_lanes,
+            request_layer_ptrs,
+            request_num_chunks,
+            request_total_tokens,
+            0,
+            1,
+            len(selected_rows[0]),
+            chunk_size,
+            False,
+        )
+        torch.npu.synchronize()
+
+        k_flat = k_dst.reshape(-1, k_hidden_dims)
+        v_flat = v_dst.reshape(-1, v_hidden_dims)
+        for request_lane, request_selected in enumerate(selected_rows):
+            for column, token in enumerate(request_selected):
+                slot = target_rows[request_lane][column]
+                value = request_lane * 100 + token
+                assert torch.all(k_flat[slot] == float(value + 1))
+                assert torch.all(v_flat[slot] == float(value + 1001))
+    finally:
+        for mem_obj in mem_objs:
+            mem_obj.ref_count_down()
+        allocator.close()
+
+
 @pytest.mark.parametrize(
     "kv_format_name",
     [

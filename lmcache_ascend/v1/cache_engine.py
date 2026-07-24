@@ -188,6 +188,44 @@ class AscendLMCacheEngine(LMCacheEngine):
                 self._store_queue_maxsize,
             )
 
+    def prepare_sparse_retrieve_batch(self, groups: dict[int, list[dict]]) -> Any:
+        """Prepare stable descriptors for one warm sparse decode batch."""
+        assert self.gpu_connector is not None, (
+            "gpu_connector is required for prepared sparse retrieve"
+        )
+        return self.gpu_connector.prepare_sparse_retrieve_batch(groups)
+
+    def retrieve_prepared_sparse_batch_layer(
+        self,
+        handle: Any,
+        kv_group: int,
+        layer_id: int,
+        selected_tokens: torch.Tensor,
+        target_slot_mapping: Optional[torch.Tensor],
+        request_ids: list,
+        payload_event: Any = None,
+    ) -> None:
+        """Retrieve one layer and KV group with a single batched NPU launch."""
+        assert self.gpu_connector is not None, (
+            "gpu_connector is required for prepared sparse retrieve"
+        )
+        self.gpu_connector.retrieve_prepared_sparse_batch_layer(
+            handle,
+            kv_group,
+            layer_id,
+            selected_tokens,
+            target_slot_mapping,
+            request_ids,
+            payload_event,
+        )
+
+    def close_sparse_retrieve_batch(self, handle: Any) -> None:
+        """Release one prepared sparse decode batch handle."""
+        assert self.gpu_connector is not None, (
+            "gpu_connector is required for prepared sparse retrieve"
+        )
+        self.gpu_connector.close_sparse_retrieve_batch(handle)
+
     def _store_worker_loop(self) -> None:
         if not self.is_store_async:
             return

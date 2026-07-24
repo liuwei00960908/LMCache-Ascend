@@ -90,7 +90,11 @@ _FUSED_OP_MODES: dict[str, _FusedOpMode | None] = {
 
 def _is_pybind_arity_type_error(exc: TypeError) -> bool:
     msg = str(exc)
-    return "incompatible function arguments" in msg or "takes" in msg and "positional" in msg
+    return (
+        "incompatible function arguments" in msg
+        or "takes" in msg
+        and "positional" in msg
+    )
 
 
 def _call_dense_extended(fn, kwargs: dict) -> None:
@@ -340,6 +344,36 @@ def sparse_mla_dsa_batched_direct_kv_transfer_prepared(
         chunk_ptrs_npu,
         chunk_size,
         total_tokens,
+        lmc_host_interleaved,
+    )
+
+
+def sparse_mla_dsa_multi_request_direct_kv_transfer_prepared(
+    destination_state,
+    slot_mapping_packed: torch.Tensor,
+    selected_token_idx: torch.Tensor,
+    row_request_lanes: torch.Tensor,
+    request_layer_ptrs: torch.Tensor,
+    request_num_chunks: torch.Tensor,
+    request_total_tokens: torch.Tensor,
+    layer_id: int,
+    num_layers: int,
+    row_width: int,
+    chunk_size: int,
+    lmc_host_interleaved: bool,
+) -> None:
+    lmc_ops.sparse_mla_dsa_multi_request_direct_kv_transfer_prepared(
+        destination_state,
+        slot_mapping_packed,
+        selected_token_idx,
+        row_request_lanes,
+        request_layer_ptrs,
+        request_num_chunks,
+        request_total_tokens,
+        layer_id,
+        num_layers,
+        row_width,
+        chunk_size,
         lmc_host_interleaved,
     )
 

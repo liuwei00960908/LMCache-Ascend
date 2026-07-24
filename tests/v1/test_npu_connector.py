@@ -883,6 +883,287 @@ def test_prepared_sparse_launch_combines_destination_request_and_step_state(
     assert args[4:] == (256, 4, True)
 
 
+def _make_prepared_batch_connector(monkeypatch):
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 2
+    connector.lmcache_chunk_size = 4
+    connector.load_stream_idx = 0
+    connector.load_stream_num = 2
+    connector.load_stream_list = [
+        _TrackingStream("load-0"),
+        _TrackingStream("load-1"),
+    ]
+    connector._prepared_sparse_source_descriptors = {}
+    connector._sparse_destination_plans = {}
+    layout = SimpleNamespace(
+        kv_device=torch.device("cpu"),
+        kv_format=SimpleNamespace(value=0),
+        k_hidden_dims=1,
+        v_hidden_dims=1,
+        dsa_hidden_dims=0,
+    )
+    connector._group_layouts = {0: layout, 1: layout}
+    connector._sparse_lmc_host_interleaved = lambda kv_group: bool(kv_group)
+    plans = {
+        0: npu_connectors._SparseDestinationPlan([], (), ("g0-l0", "g0-l1")),
+        1: npu_connectors._SparseDestinationPlan([], (), ("g1-l0", "g1-l1")),
+    }
+    monkeypatch.setattr(
+        connector,
+        "_get_or_create_sparse_destination_plan",
+        lambda **kwargs: plans[kwargs["kv_group"]],
+    )
+    compute = _TrackingStream("compute")
+    monkeypatch.setattr(
+        npu_connectors.torch,
+        "npu",
+        SimpleNamespace(current_stream=lambda: compute),
+        raising=False,
+    )
+    return connector, compute
+
+
+def _batch_source(base_ptr: int) -> PreparedSparseSource:
+    return PreparedSparseSource(
+        layers=tuple(
+            PreparedSparseSourceLayer(
+                tensors=(torch.zeros(4),),
+                chunk_ptrs_npu=torch.tensor(
+                    [base_ptr + layer_id], dtype=torch.int64
+                ),
+            )
+            for layer_id in range(2)
+        ),
+        total_tokens=4,
+    )
+
+
+def test_prepared_sparse_batch_runtime_symbols_are_defined() -> None:
+    assert npu_connectors._PREPARED_SPARSE_SOURCE_CACHE_SIZE > 0
+    assert npu_connectors._PREPARED_SPARSE_ROW_CACHE_SIZE > 0
+    assert isinstance(npu_connectors._PreparedSparseSourceDescriptor, type)
+    assert isinstance(npu_connectors._PreparedSparseBatchGroup, type)
+    assert isinstance(npu_connectors._PreparedSparseBatch, type)
+    assert callable(
+        npu_connectors.sparse_mla_dsa_multi_request_direct_kv_transfer_prepared
+    )
+
+
+def test_prepared_sparse_batch_single_launch_maps_reordered_duplicate_rows(
+    monkeypatch,
+) -> None:
+    connector, compute = _make_prepared_batch_connector(monkeypatch)
+    kvcaches = [object(), object()]
+    source_a = _batch_source(100)
+    source_b = _batch_source(200)
+    handle = connector.prepare_sparse_retrieve_batch(
+        {
+            0: [
+                {
+                    "req_id": "a",
+                    "prepared_sparse_source": source_a,
+                    "kvcaches": kvcaches,
+                    "slot_mapping": torch.tensor([10, 11]),
+                },
+                {
+                    "req_id": "b",
+                    "prepared_sparse_source": source_b,
+                    "kvcaches": kvcaches,
+                    "slot_mapping": torch.tensor([20, 21]),
+                },
+            ]
+        }
+    )
+    calls = []
+    monkeypatch.setattr(
+        npu_connectors,
+        "sparse_mla_dsa_multi_request_direct_kv_transfer_prepared",
+        lambda *args: calls.append(args),
+    )
+    selected = torch.tensor(
+        [[20, 90, 10, 22], [21, 91, 11, 23]], dtype=torch.int32
+    ).t()
+    targets = torch.tensor(
+        [[120, 190, 110, 122], [121, 191, 111, 123]], dtype=torch.long
+    ).t()
+    assert not selected.is_contiguous()
+    assert not targets.is_contiguous()
+
+    connector.retrieve_prepared_sparse_batch_layer(
+        handle,
+        0,
+        0,
+        selected,
+        targets,
+        ["b", "other", "a", "b"],
+    )
+
+    assert len(calls) == 1
+    assert calls[0][0] == "g0-l0"
+    assert calls[0][1].tolist() == [120, 121, 110, 111, 122, 123]
+    assert calls[0][2].tolist() == [20, 21, 10, 11, 22, 23]
+    assert calls[0][3].tolist() == [1, 0, 1]
+    assert calls[0][1].is_contiguous()
+    assert calls[0][2].is_contiguous()
+    assert calls[0][2].dtype == torch.int32
+    assert calls[0][3].dtype == torch.int32
+    assert calls[0][4].dtype == torch.int64
+    assert calls[0][5].dtype == torch.int32
+    assert calls[0][6].dtype == torch.int32
+    assert calls[0][9] == 2
+    row_indices, native_lanes, fallback_lanes = handle.groups[0].row_mappings[
+        ("b", "other", "a", "b")
+    ]
+    assert row_indices.dtype == torch.int64
+    assert native_lanes.dtype == torch.int32
+    assert fallback_lanes.dtype == torch.int64
+    assert connector.load_stream_list[0].events == [("wait_stream", "compute")]
+    assert compute.events == [("wait_stream", "load-0")]
+
+
+def test_prepared_sparse_batch_rejects_inconsistent_rank_two_inputs(
+    monkeypatch,
+) -> None:
+    connector, _ = _make_prepared_batch_connector(monkeypatch)
+    kvcaches = [object(), object()]
+    handle = connector.prepare_sparse_retrieve_batch(
+        {
+            0: [
+                {
+                    "req_id": "a",
+                    "prepared_sparse_source": _batch_source(100),
+                    "kvcaches": kvcaches,
+                    "slot_mapping": torch.tensor([10, 11]),
+                }
+            ]
+        }
+    )
+
+    with pytest.raises(ValueError, match="rank 2"):
+        connector.retrieve_prepared_sparse_batch_layer(
+            handle, 0, 0, torch.tensor([1, 2], dtype=torch.int32), None, ["a"]
+        )
+    with pytest.raises(ValueError, match="must match selected_tokens"):
+        connector.retrieve_prepared_sparse_batch_layer(
+            handle,
+            0,
+            0,
+            torch.tensor([[1, 2]], dtype=torch.int32),
+            torch.tensor([[10]], dtype=torch.long),
+            ["a"],
+        )
+
+
+def test_prepared_sparse_batch_reuses_descriptors_and_fallback_targets(
+    monkeypatch,
+) -> None:
+    connector, _ = _make_prepared_batch_connector(monkeypatch)
+    kvcaches = [object(), object()]
+    source_a = _batch_source(100)
+    source_b = _batch_source(200)
+    groups = {
+        0: [
+            {
+                "req_id": "a",
+                "prepared_sparse_source": source_a,
+                "kvcaches": kvcaches,
+                "slot_mapping": torch.tensor([10, 11]),
+            },
+            {
+                "req_id": "b",
+                "prepared_sparse_source": source_b,
+                "kvcaches": kvcaches,
+                "slot_mapping": torch.tensor([20, 21]),
+            },
+        ]
+    }
+    first = connector.prepare_sparse_retrieve_batch(groups)
+    cached_descriptors = tuple(connector._prepared_sparse_source_descriptors.values())
+    second = connector.prepare_sparse_retrieve_batch(groups)
+    assert tuple(connector._prepared_sparse_source_descriptors.values()) == (
+        cached_descriptors
+    )
+
+    calls = []
+    stack_calls = []
+    original_stack = torch.stack
+    monkeypatch.setattr(
+        npu_connectors,
+        "sparse_mla_dsa_multi_request_direct_kv_transfer_prepared",
+        lambda *args: calls.append(args),
+    )
+    monkeypatch.setattr(
+        torch,
+        "stack",
+        lambda *args, **kwargs: stack_calls.append(args) or original_stack(
+            *args, **kwargs
+        ),
+    )
+    selected = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.int32)
+    for layer_id in range(2):
+        connector.retrieve_prepared_sparse_batch_layer(
+            second,
+            0,
+            layer_id,
+            selected,
+            None,
+            ["b", "a", "b"],
+        )
+
+    assert len(calls) == 2
+    assert calls[0][1].tolist() == [20, 21, 10, 11, 20, 21]
+    assert calls[1][1].tolist() == [20, 21, 10, 11, 20, 21]
+    assert len(stack_calls) == 1
+    assert calls[0][4] is calls[1][4]
+    connector.close_sparse_retrieve_batch(first)
+    connector.close_sparse_retrieve_batch(second)
+
+
+def test_prepared_sparse_batch_keeps_groups_and_payload_waits_separate(
+    monkeypatch,
+) -> None:
+    connector, compute = _make_prepared_batch_connector(monkeypatch)
+    sources = [_batch_source(100), _batch_source(300)]
+    kvcaches = [[object(), object()], [object(), object()]]
+    handle = connector.prepare_sparse_retrieve_batch(
+        {
+            group: [
+                {
+                    "req_id": "a",
+                    "prepared_sparse_source": sources[group],
+                    "kvcaches": kvcaches[group],
+                    "slot_mapping": torch.tensor([10 + group]),
+                }
+            ]
+            for group in (0, 1)
+        }
+    )
+    calls = []
+    monkeypatch.setattr(
+        npu_connectors,
+        "sparse_mla_dsa_multi_request_direct_kv_transfer_prepared",
+        lambda *args: calls.append(args),
+    )
+    payload = _TrackingEvent("payload")
+    selected = torch.tensor([[1]], dtype=torch.int32)
+    targets = torch.tensor([[9]], dtype=torch.long)
+    for group in (0, 1):
+        connector.retrieve_prepared_sparse_batch_layer(
+            handle, group, 1, selected, targets, ["a"], payload
+        )
+
+    assert [call[0] for call in calls] == ["g0-l1", "g1-l1"]
+    assert calls[0][4] is not calls[1][4]
+    assert connector.load_stream_list[0].events == [("wait_stream", "compute")]
+    assert connector.load_stream_list[1].events == [("wait_stream", "compute")]
+    assert compute.events == [
+        ("wait_event", "payload"),
+        ("wait_stream", "load-0"),
+        ("wait_event", "payload"),
+        ("wait_stream", "load-1"),
+    ]
+
+
 def test_deferred_sparse_consumer_wait_joins_after_all_submissions(
     monkeypatch,
 ) -> None:

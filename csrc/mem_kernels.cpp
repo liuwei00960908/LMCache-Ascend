@@ -748,6 +748,152 @@ void sparse_mla_dsa_batched_direct_kv_transfer_prepared(
   cmd.Run();
 }
 
+void sparse_mla_dsa_multi_request_direct_kv_transfer_prepared(
+    const SparseDirectDestinationState &destination_state,
+    torch::Tensor &slot_mapping_packed, torch::Tensor &selected_token_idx,
+    torch::Tensor &row_request_lanes, torch::Tensor &request_layer_ptrs,
+    torch::Tensor &request_num_chunks, torch::Tensor &request_total_tokens,
+    const int64_t layer_id, const int64_t num_layers, const int64_t row_width,
+    const int64_t chunk_size, const bool lmc_host_interleaved) {
+  TORCH_CHECK(slot_mapping_packed.defined() && selected_token_idx.defined() &&
+                  row_request_lanes.defined() && request_layer_ptrs.defined() &&
+                  request_num_chunks.defined() && request_total_tokens.defined(),
+              "multi-request sparse transfer tensors must be defined.");
+  TORCH_CHECK(slot_mapping_packed.dim() == 1 || slot_mapping_packed.dim() == 2,
+              "slot_mapping_packed must be flattened or rank-2.");
+  TORCH_CHECK(selected_token_idx.dim() == 1 || selected_token_idx.dim() == 2,
+              "selected_token_idx must be flattened or rank-2.");
+  TORCH_CHECK(row_request_lanes.dim() == 1,
+              "row_request_lanes must be 1D.");
+  TORCH_CHECK(request_layer_ptrs.dim() == 1,
+              "request_layer_ptrs must be 1D.");
+  TORCH_CHECK(request_num_chunks.dim() == 1,
+              "request_num_chunks must be 1D.");
+  TORCH_CHECK(request_total_tokens.dim() == 1,
+              "request_total_tokens must be 1D.");
+  TORCH_CHECK(slot_mapping_packed.scalar_type() == at::ScalarType::Int ||
+                  slot_mapping_packed.scalar_type() == at::ScalarType::Long,
+              "slot_mapping_packed must be torch.int32 or torch.int64.");
+  TORCH_CHECK(selected_token_idx.scalar_type() == at::ScalarType::Int,
+              "selected_token_idx must be torch.int32.");
+  TORCH_CHECK(row_request_lanes.scalar_type() == at::ScalarType::Int,
+              "row_request_lanes must be torch.int32.");
+  TORCH_CHECK(request_layer_ptrs.scalar_type() == at::ScalarType::Long,
+              "request_layer_ptrs must be torch.int64.");
+  TORCH_CHECK(request_num_chunks.scalar_type() == at::ScalarType::Int,
+              "request_num_chunks must be torch.int32.");
+  TORCH_CHECK(request_total_tokens.scalar_type() == at::ScalarType::Int,
+              "request_total_tokens must be torch.int32.");
+  TORCH_CHECK(slot_mapping_packed.is_contiguous() &&
+                  selected_token_idx.is_contiguous() &&
+                  row_request_lanes.is_contiguous() &&
+                  request_layer_ptrs.is_contiguous() &&
+                  request_num_chunks.is_contiguous() &&
+                  request_total_tokens.is_contiguous(),
+              "multi-request sparse transfer tensors must be contiguous.");
+
+  const torch::Device device = slot_mapping_packed.device();
+  TORCH_CHECK(device.is_privateuseone(),
+              "multi-request sparse transfer tensors must be on NPU.");
+  TORCH_CHECK(selected_token_idx.device() == device &&
+                  row_request_lanes.device() == device &&
+                  request_layer_ptrs.device() == device &&
+                  request_num_chunks.device() == device &&
+                  request_total_tokens.device() == device,
+              "multi-request sparse transfer tensors must be on the same NPU.");
+  TORCH_CHECK(destination_state.slot_type_num ==
+                  vllm_ascend::get_dtype_from_torch(
+                      slot_mapping_packed.scalar_type()),
+              "slot_mapping_packed dtype must match destination_state.");
+  TORCH_CHECK(is_mla_dsa_format(destination_state.kvcache_format),
+              "Multi-request prepared sparse transfer only supports MLA/DSA formats.");
+
+  TORCH_CHECK(layer_id >= 0 && layer_id < num_layers,
+              "layer_id must be in [0, num_layers).");
+  TORCH_CHECK(num_layers > 0 &&
+                  num_layers <= std::numeric_limits<int32_t>::max(),
+              "num_layers must fit in positive int32.");
+  TORCH_CHECK(row_width > 0 &&
+                  row_width <= std::numeric_limits<int32_t>::max(),
+              "row_width must fit in positive int32.");
+  TORCH_CHECK(chunk_size > 0 &&
+                  chunk_size <= std::numeric_limits<int32_t>::max(),
+              "chunk_size must fit in positive int32.");
+
+  const int64_t num_sparse = selected_token_idx.numel();
+  TORCH_CHECK(num_sparse > 0 &&
+                  num_sparse <= std::numeric_limits<int32_t>::max(),
+              "selected_token_idx numel must fit in positive int32.");
+  TORCH_CHECK(slot_mapping_packed.numel() == num_sparse,
+              "slot_mapping_packed and selected_token_idx must have the same numel.");
+  TORCH_CHECK(num_sparse % row_width == 0,
+              "selected_token_idx numel must be divisible by row_width.");
+  const int64_t num_rows = num_sparse / row_width;
+  if (slot_mapping_packed.dim() == 2) {
+    TORCH_CHECK(slot_mapping_packed.size(0) == num_rows &&
+                    slot_mapping_packed.size(1) == row_width,
+                "rank-2 slot_mapping_packed shape must match row_width.");
+  }
+  TORCH_CHECK(row_request_lanes.numel() == num_rows,
+              "row_request_lanes must contain one lane per row.");
+
+  const int64_t num_requests = request_layer_ptrs.numel();
+  TORCH_CHECK(num_requests > 0 &&
+                  num_requests <= std::numeric_limits<int32_t>::max(),
+              "request count must fit in positive int32.");
+  TORCH_CHECK(request_num_chunks.numel() == num_requests &&
+                  request_total_tokens.numel() == num_requests,
+              "per-request metadata tensors must have the same numel.");
+
+  const c10::OptionalDeviceGuard slot_device_guard(device_of(slot_mapping_packed));
+  const int32_t num_sparse_i = static_cast<int32_t>(num_sparse);
+  const uint32_t aiv_num =
+      static_cast<uint32_t>(std::min(4, static_cast<int>(num_sparse_i)));
+  aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+  const SparseDirectDestinationState state = destination_state;
+
+  uint8_t *slot_mapping_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(slot_mapping_packed);
+  uint8_t *selected_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(selected_token_idx);
+  uint8_t *row_lanes_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(row_request_lanes);
+  uint8_t *layer_ptrs_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(request_layer_ptrs);
+  uint8_t *num_chunks_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(request_num_chunks);
+  uint8_t *total_tokens_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(request_total_tokens);
+
+  const int32_t row_width_i = static_cast<int32_t>(row_width);
+  const int32_t num_requests_i = static_cast<int32_t>(num_requests);
+  const int32_t layer_id_i = static_cast<int32_t>(layer_id);
+  const int32_t num_layers_i = static_cast<int32_t>(num_layers);
+  const int32_t chunk_size_i = static_cast<int32_t>(chunk_size);
+
+  at_npu::native::OpCommand cmd;
+  cmd.Name("sparse_mla_dsa_multi_request_direct_kv_transfer_prepared");
+  cmd.SetCustomHandler(
+      [state, stream, aiv_num, layer_ptrs_ptr, num_chunks_ptr,
+       total_tokens_ptr, row_lanes_ptr, slot_mapping_ptr, selected_ptr,
+       num_sparse_i, row_width_i, num_requests_i, layer_id_i, num_layers_i,
+       chunk_size_i, lmc_host_interleaved]() -> int {
+        kvcache_ops::single_layer_kv_transfer_kernel_v2_mla_dsa_sparse_multi_request(
+            state.scalar_type_num, state.slot_type_num,
+            kernel_format(state.kvcache_format), aiv_num, stream,
+            layer_ptrs_ptr, num_chunks_ptr, total_tokens_ptr, row_lanes_ptr,
+            state.vllm_k_ptr, state.vllm_v_ptr, state.vllm_dsa_ptr,
+            slot_mapping_ptr, selected_ptr, state.vllm_k_bytes,
+            state.vllm_v_bytes, state.vllm_dsa_bytes,
+            state.max_tokens_per_loop, state.k_hidden_dims,
+            state.v_hidden_dims, state.dsa_hidden_dims, num_sparse_i,
+            row_width_i, num_requests_i, layer_id_i, num_layers_i,
+            chunk_size_i, state.block_size, lmc_host_interleaved);
+        return 0;
+      });
+  cmd.Run();
+}
+
 static void validate_dense_direct_inputs(torch::Tensor &slot_mapping_full,
                                          torch::Tensor &chunk_ptrs_npu,
                                          torch::Tensor &chunk_offsets_npu,

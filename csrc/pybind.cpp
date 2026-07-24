@@ -139,6 +139,20 @@ void sparse_mla_dsa_batched_direct_kv_transfer_prepared_wrapper(
       chunk_ptrs_npu, chunk_size, total_tokens, lmc_host_interleaved);
 }
 
+void sparse_mla_dsa_multi_request_direct_kv_transfer_prepared_wrapper(
+    const SparseDirectDestinationState &destination_state,
+    torch::Tensor &slot_mapping_packed, torch::Tensor &selected_token_idx,
+    torch::Tensor &row_request_lanes, torch::Tensor &request_layer_ptrs,
+    torch::Tensor &request_num_chunks, torch::Tensor &request_total_tokens,
+    int64_t layer_id, int64_t num_layers, int64_t row_width,
+    int64_t chunk_size, bool lmc_host_interleaved) {
+  sparse_mla_dsa_multi_request_direct_kv_transfer_prepared(
+      destination_state, slot_mapping_packed, selected_token_idx,
+      row_request_lanes, request_layer_ptrs, request_num_chunks,
+      request_total_tokens, layer_id, num_layers, row_width, chunk_size,
+      lmc_host_interleaved);
+}
+
 void dense_mla_dsa_batched_direct_kv_transfer_wrapper(
     std::vector<torch::Tensor> &lmc_tensors, const py::object &vllm_kv_caches_obj,
     torch::Tensor &slot_mapping_full, torch::Tensor &chunk_offsets_npu,
@@ -267,6 +281,14 @@ PYBIND11_MODULE(c_ops, m) {
         py::arg("destination_state"), py::arg("slot_mapping_packed"),
         py::arg("selected_token_idx"), py::arg("chunk_ptrs_npu"),
         py::arg("chunk_size"), py::arg("total_tokens"),
+        py::arg("lmc_host_interleaved"));
+  m.def("sparse_mla_dsa_multi_request_direct_kv_transfer_prepared",
+        &sparse_mla_dsa_multi_request_direct_kv_transfer_prepared_wrapper,
+        py::arg("destination_state"), py::arg("slot_mapping_packed"),
+        py::arg("selected_token_idx"), py::arg("row_request_lanes"),
+        py::arg("request_layer_ptrs"), py::arg("request_num_chunks"),
+        py::arg("request_total_tokens"), py::arg("layer_id"),
+        py::arg("num_layers"), py::arg("row_width"), py::arg("chunk_size"),
         py::arg("lmc_host_interleaved"));
   m.def("dense_mla_dsa_batched_direct_kv_transfer",
         &dense_mla_dsa_batched_direct_kv_transfer_wrapper,

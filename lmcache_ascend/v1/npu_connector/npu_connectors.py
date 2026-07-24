@@ -36,6 +36,7 @@ from lmcache_ascend.v1.npu_connector.utils import (
     sparse_mla_dsa_batched_direct_kv_transfer,
     sparse_mla_dsa_batched_direct_kv_transfer_fast,
     sparse_mla_dsa_batched_direct_kv_transfer_prepared,
+    sparse_mla_dsa_multi_request_direct_kv_transfer_prepared,
 )
 from lmcache_ascend.v1.proxy_memory_obj import ProxyMemoryObj
 
@@ -55,6 +56,8 @@ _DENSE_DIRECT_STORE_DISABLE = _DENSE_DIRECT_DISABLE or os.getenv(
 ).lower() in ("1", "true", "yes", "on")
 
 _SPARSE_DESTINATION_PLAN_CACHE_SIZE = 2
+_PREPARED_SPARSE_SOURCE_CACHE_SIZE = 256
+_PREPARED_SPARSE_ROW_CACHE_SIZE = 16
 
 
 def _wait_payload_events(stream: Any, payload_event: Any) -> None:
@@ -1218,6 +1221,61 @@ class _SparseDestinationPlan:
         self.states = states
 
 
+class _PreparedSparseSourceDescriptor:
+    __slots__ = ("signature", "layer_ptrs")
+
+    def __init__(self, signature: tuple, layer_ptrs: torch.Tensor) -> None:
+        self.signature = signature
+        self.layer_ptrs = layer_ptrs
+
+
+class _PreparedSparseBatchGroup:
+    __slots__ = (
+        "items",
+        "request_lanes",
+        "request_layer_ptrs",
+        "request_num_chunks",
+        "request_total_tokens",
+        "descriptors",
+        "plan",
+        "layout",
+        "row_mappings",
+        "default_targets",
+    )
+
+    def __init__(
+        self,
+        items: list[dict[str, Any]],
+        request_lanes: dict[Any, int],
+        request_layer_ptrs: torch.Tensor,
+        request_num_chunks: torch.Tensor,
+        request_total_tokens: torch.Tensor,
+        descriptors: list[_PreparedSparseSourceDescriptor],
+        plan: _SparseDestinationPlan,
+        layout: Any,
+    ) -> None:
+        self.items = items
+        self.request_lanes = request_lanes
+        self.request_layer_ptrs = request_layer_ptrs
+        self.request_num_chunks = request_num_chunks
+        self.request_total_tokens = request_total_tokens
+        self.descriptors = descriptors
+        self.plan = plan
+        self.layout = layout
+        self.row_mappings: dict[
+            tuple[Any, ...], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = {}
+        self.default_targets: dict[int, torch.Tensor] = {}
+
+
+class _PreparedSparseBatch:
+    __slots__ = ("groups", "closed")
+
+    def __init__(self, groups: dict[int, _PreparedSparseBatchGroup]) -> None:
+        self.groups = groups
+        self.closed = False
+
+
 class _SparseLoadJoin:
     """One layer/group fan-out from a compute stream to load streams."""
 
@@ -1286,6 +1344,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self._sparse_direct_validated_layers: set = set()
         # One process-owned destination plan per latent/indexer KV group.
         self._sparse_destination_plans: dict[int, _SparseDestinationPlan] = {}
+        self._prepared_sparse_source_descriptors: dict[
+            int, _PreparedSparseSourceDescriptor
+        ] = {}
 
     @contextmanager
     def defer_sparse_load_consumer_wait(self) -> Generator[None, None, None]:
@@ -2140,6 +2201,362 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         process-owned destination state and consumes request pointers dynamically.
         """
         self._reset_sparse_direct_layer_states()
+
+    @staticmethod
+    def _prepared_sparse_source_signature(source: PreparedSparseSource) -> tuple:
+        return tuple(
+            (
+                id(layer.chunk_ptrs_npu),
+                int(layer.chunk_ptrs_npu.data_ptr()),
+                int(layer.chunk_ptrs_npu.numel()),
+                layer.chunk_ptrs_npu.dtype,
+                str(layer.chunk_ptrs_npu.device),
+            )
+            for layer in source.layers
+        )
+
+    def _get_prepared_sparse_source_descriptor(
+        self,
+        source: PreparedSparseSource,
+        expected_device: torch.device,
+    ) -> _PreparedSparseSourceDescriptor:
+        if len(source.layers) != self.num_layers:
+            raise ValueError(
+                "Prepared sparse source has the wrong layer count: "
+                f"source={len(source.layers)}, connector={self.num_layers}"
+            )
+        chunk_counts = {int(layer.chunk_ptrs_npu.numel()) for layer in source.layers}
+        if len(chunk_counts) != 1 or not chunk_counts or next(iter(chunk_counts)) <= 0:
+            raise ValueError(
+                "Prepared sparse source layers must have the same nonzero chunk count"
+            )
+        for layer_id, layer in enumerate(source.layers):
+            pointers = layer.chunk_ptrs_npu
+            if (
+                pointers.dim() != 1
+                or pointers.dtype != torch.long
+                or pointers.device != expected_device
+                or not pointers.is_contiguous()
+            ):
+                raise ValueError(
+                    "Prepared sparse chunk pointers must be contiguous NPU int64 "
+                    f"vectors on the destination device: layer={layer_id} "
+                    f"dtype={pointers.dtype} device={pointers.device}"
+                )
+
+        signature = self._prepared_sparse_source_signature(source)
+        cache = getattr(self, "_prepared_sparse_source_descriptors", None)
+        if cache is None:
+            cache = {}
+            self._prepared_sparse_source_descriptors = cache
+        key = id(source)
+        descriptor = cache.pop(key, None)
+        if (
+            descriptor is not None
+            and descriptor.signature == signature
+        ):
+            cache[key] = descriptor
+            return descriptor
+
+        layer_ptrs = torch.tensor(
+            [int(layer.chunk_ptrs_npu.data_ptr()) for layer in source.layers],
+            dtype=torch.long,
+            device=expected_device,
+        )
+        if expected_device.type != "cpu":
+            for stream in self.load_stream_list:
+                layer_ptrs.record_stream(stream)
+                for layer in source.layers:
+                    layer.chunk_ptrs_npu.record_stream(stream)
+        descriptor = _PreparedSparseSourceDescriptor(signature, layer_ptrs)
+        cache[key] = descriptor
+        while len(cache) > _PREPARED_SPARSE_SOURCE_CACHE_SIZE:
+            del cache[next(iter(cache))]
+        return descriptor
+
+    def prepare_sparse_retrieve_batch(
+        self, groups: dict[int, list[dict[str, Any]]]
+    ) -> _PreparedSparseBatch:
+        """Seal warm sparse requests into reusable per-step NPU descriptors."""
+        prepared_groups: dict[int, _PreparedSparseBatchGroup] = {}
+        for raw_group, raw_items in groups.items():
+            kv_group = int(raw_group)
+            if not raw_items:
+                continue
+            items = list(raw_items)
+            first_kvcaches = items[0]["kvcaches"]
+            layout = self._group_layouts.get(kv_group)
+            if layout is None:
+                layout = self._lazy_initialize_buffer_with_staging(
+                    first_kvcaches, kv_group=kv_group, init_staging=False
+                )
+            expected_device = layout.kv_device
+            if expected_device is None:
+                raise ValueError(f"kv_group={kv_group} has no destination device")
+
+            request_lanes: dict[Any, int] = {}
+            descriptors = []
+            for lane, item in enumerate(items):
+                for field in (
+                    "req_id",
+                    "prepared_sparse_source",
+                    "kvcaches",
+                    "slot_mapping",
+                ):
+                    if field not in item:
+                        raise ValueError(f"Prepared sparse item is missing {field!r}")
+                req_id = item["req_id"]
+                if req_id in request_lanes:
+                    raise ValueError(
+                        "Duplicate req_id in prepared sparse group "
+                        f"{kv_group}: {req_id}"
+                    )
+                if item["kvcaches"] is not first_kvcaches:
+                    raise ValueError(
+                        "Prepared sparse requests in one group must share kvcaches"
+                    )
+                slot_mapping = item["slot_mapping"]
+                if (
+                    not isinstance(slot_mapping, torch.Tensor)
+                    or slot_mapping.dim() != 1
+                    or slot_mapping.device != expected_device
+                    or slot_mapping.dtype != torch.long
+                    or not slot_mapping.is_contiguous()
+                ):
+                    raise ValueError(
+                        "Prepared sparse request slot_mapping must be a contiguous "
+                        f"rank-1 int64 tensor on {expected_device}"
+                    )
+                source = item["prepared_sparse_source"]
+                if int(source.total_tokens) <= 0:
+                    raise ValueError(
+                        "Prepared sparse source must cover at least one token"
+                    )
+                descriptor = self._get_prepared_sparse_source_descriptor(
+                    source, expected_device
+                )
+                num_chunks = int(source.layers[0].chunk_ptrs_npu.numel())
+                if num_chunks > torch.iinfo(torch.int32).max:
+                    raise ValueError("Prepared sparse chunk count exceeds int32")
+                if int(source.total_tokens) > torch.iinfo(torch.int32).max:
+                    raise ValueError("Prepared sparse token count exceeds int32")
+                chunk_counts = source.chunk_token_counts
+                if not chunk_counts and num_chunks > 1:
+                    raise ValueError(
+                        "Prepared sparse multi-chunk source requires chunk coverage"
+                    )
+                if chunk_counts:
+                    expected_last = int(source.total_tokens) - (
+                        len(chunk_counts) - 1
+                    ) * self.lmcache_chunk_size
+                    if (
+                        expected_last <= 0
+                        or any(
+                            int(count) != self.lmcache_chunk_size
+                            for count in chunk_counts[:-1]
+                        )
+                        or int(chunk_counts[-1]) != expected_last
+                    ):
+                        raise ValueError(
+                            "Prepared sparse batch requires fixed non-final chunks"
+                        )
+                if num_chunks * self.lmcache_chunk_size < int(source.total_tokens):
+                    raise ValueError(
+                        "Prepared sparse source chunk pointers do not cover "
+                        "total_tokens"
+                    )
+                request_lanes[req_id] = lane
+                descriptors.append(descriptor)
+
+            destination_plan = self._get_or_create_sparse_destination_plan(
+                kvcaches_ref=first_kvcaches,
+                kv_group=kv_group,
+                slot_mapping_ref=items[0]["slot_mapping"],
+                sparse_kv_format=layout.kv_format.value,
+                sparse_k_hidden_dims=layout.k_hidden_dims,
+                sparse_v_hidden_dims=layout.v_hidden_dims,
+                sparse_dsa_hidden_dims=layout.dsa_hidden_dims,
+                expected_device=expected_device,
+            )
+            prepared_groups[kv_group] = _PreparedSparseBatchGroup(
+                items,
+                request_lanes,
+                torch.tensor(
+                    [descriptor.layer_ptrs.data_ptr() for descriptor in descriptors],
+                    dtype=torch.long,
+                    device=expected_device,
+                ),
+                torch.tensor(
+                    [
+                        item["prepared_sparse_source"]
+                        .layers[0]
+                        .chunk_ptrs_npu.numel()
+                        for item in items
+                    ],
+                    dtype=torch.int32,
+                    device=expected_device,
+                ),
+                torch.tensor(
+                    [item["prepared_sparse_source"].total_tokens for item in items],
+                    dtype=torch.int32,
+                    device=expected_device,
+                ),
+                descriptors,
+                destination_plan,
+                layout,
+            )
+        return _PreparedSparseBatch(prepared_groups)
+
+    def _prepared_sparse_row_mapping(
+        self,
+        group: _PreparedSparseBatchGroup,
+        request_ids: tuple[Any, ...],
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        cached = group.row_mappings.pop(request_ids, None)
+        if cached is not None:
+            group.row_mappings[request_ids] = cached
+            return cached
+        row_indices = []
+        row_lanes = []
+        for row, req_id in enumerate(request_ids):
+            lane = group.request_lanes.get(req_id)
+            if lane is not None:
+                row_indices.append(row)
+                row_lanes.append(lane)
+        cached = (
+            torch.tensor(row_indices, dtype=torch.long, device=device),
+            torch.tensor(row_lanes, dtype=torch.int32, device=device),
+            torch.tensor(row_lanes, dtype=torch.long, device=device),
+        )
+        group.row_mappings[request_ids] = cached
+        while len(group.row_mappings) > _PREPARED_SPARSE_ROW_CACHE_SIZE:
+            del group.row_mappings[next(iter(group.row_mappings))]
+        return cached
+
+    def retrieve_prepared_sparse_batch_layer(
+        self,
+        handle: _PreparedSparseBatch,
+        kv_group: int,
+        layer_id: int,
+        selected_tokens: torch.Tensor,
+        target_slot_mapping: Optional[torch.Tensor],
+        request_ids: list[Any],
+        payload_event: Any = None,
+    ) -> None:
+        if not isinstance(handle, _PreparedSparseBatch) or handle.closed:
+            raise ValueError("Prepared sparse batch handle is closed or invalid")
+        if layer_id < 0 or layer_id >= self.num_layers:
+            raise ValueError(f"Prepared sparse layer_id out of bounds: {layer_id}")
+        group = handle.groups.get(int(kv_group))
+        if group is None:
+            return
+        device = group.layout.kv_device
+        if not isinstance(selected_tokens, torch.Tensor) or selected_tokens.dim() != 2:
+            raise ValueError("selected_tokens must have rank 2 [rows, width]")
+        rows, width = int(selected_tokens.shape[0]), int(selected_tokens.shape[1])
+        if len(request_ids) != rows:
+            raise ValueError(
+                "request_ids must be row-aligned with selected_tokens: "
+                f"{len(request_ids)} vs {rows}"
+            )
+        if width == 0 or rows == 0:
+            return
+        current_stream = (
+            torch.npu.current_stream()
+            if hasattr(torch, "npu") and hasattr(torch.npu, "current_stream")
+            else torch.cuda.current_stream()
+        )
+        if payload_event is not None:
+            _wait_payload_events(current_stream, payload_event)
+        if selected_tokens.dtype != torch.int32 or selected_tokens.device != device:
+            selected_tokens = selected_tokens.to(device=device, dtype=torch.int32)
+        if not selected_tokens.is_contiguous():
+            selected_tokens = selected_tokens.contiguous()
+
+        request_key = tuple(request_ids)
+        row_indices, row_lanes, lane_indices = self._prepared_sparse_row_mapping(
+            group, request_key, device
+        )
+        if row_indices.numel() == 0:
+            return
+        subset = int(row_indices.numel()) != rows
+        selected_group = (
+            selected_tokens.index_select(0, row_indices) if subset else selected_tokens
+        )
+
+        if target_slot_mapping is not None:
+            if (
+                not isinstance(target_slot_mapping, torch.Tensor)
+                or target_slot_mapping.dim() != 2
+                or tuple(target_slot_mapping.shape) != (rows, width)
+            ):
+                raise ValueError(
+                    "target_slot_mapping must match selected_tokens [rows, width]"
+                )
+            if (
+                target_slot_mapping.dtype != torch.long
+                or target_slot_mapping.device != device
+            ):
+                target_slot_mapping = target_slot_mapping.to(
+                    device=device, dtype=torch.long
+                )
+            if not target_slot_mapping.is_contiguous():
+                target_slot_mapping = target_slot_mapping.contiguous()
+            target_group = (
+                target_slot_mapping.index_select(0, row_indices)
+                if subset
+                else target_slot_mapping
+            )
+        else:
+            target_rows = group.default_targets.get(width)
+            if target_rows is None:
+                slot_rows = []
+                for item in group.items:
+                    slot_mapping = item["slot_mapping"]
+                    if int(slot_mapping.numel()) < width:
+                        raise ValueError(
+                            "Prepared sparse request slot_mapping is shorter than "
+                            "row width"
+                        )
+                    row = slot_mapping[:width]
+                    if row.dtype != torch.long:
+                        row = row.to(dtype=torch.long)
+                    slot_rows.append(row)
+                target_rows = torch.stack(slot_rows, dim=0).contiguous()
+                group.default_targets[width] = target_rows
+            target_group = target_rows.index_select(0, lane_indices)
+
+        selected_flat = selected_group.reshape(-1).contiguous()
+        target_flat = target_group.reshape(-1).contiguous()
+
+        load_stream_idx = self.load_stream_idx
+        self.load_stream_idx = (load_stream_idx + 1) % self.load_stream_num
+        load_stream = self.load_stream_list[load_stream_idx]
+        with self._stream_context_or_null(load_stream):
+            load_stream.wait_stream(current_stream)
+            sparse_mla_dsa_multi_request_direct_kv_transfer_prepared(
+                group.plan.states[layer_id],
+                target_flat,
+                selected_flat,
+                row_lanes,
+                group.request_layer_ptrs,
+                group.request_num_chunks,
+                group.request_total_tokens,
+                layer_id,
+                self.num_layers,
+                width,
+                self.lmcache_chunk_size,
+                self._sparse_lmc_host_interleaved(int(kv_group)),
+            )
+        current_stream.wait_stream(load_stream)
+
+    def close_sparse_retrieve_batch(self, handle: _PreparedSparseBatch) -> None:
+        if not isinstance(handle, _PreparedSparseBatch):
+            raise ValueError("Invalid prepared sparse batch handle")
+        if not handle.closed:
+            handle.closed = True
+            handle.groups.clear()
 
     def _resolve_sparse_chunk_ptrs_npu(
         self,
