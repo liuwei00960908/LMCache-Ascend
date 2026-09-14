@@ -19,6 +19,9 @@ from lmcache_ascend.v1.npu_connector.npu_connectors import (
 def _destination_setup(monkeypatch, layers=2):
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.num_layers = layers
+    connector.dsa_two_groups = False
+    connector.runtime_kv_group_layer_counts = None
+    connector._group_layouts = {}
     connector.enable_npu_transfer_validation = True
     connector._sparse_destination_plans = {}
     caches = [[torch.zeros((2, 4))] for _ in range(layers)]
@@ -37,6 +40,78 @@ def _destination_setup(monkeypatch, layers=2):
         expected_device=torch.device("cpu"),
     )
     return connector, caches, kwargs, prepare
+
+
+@pytest.mark.parametrize("layers,indexer_layers", [(2, 2), (79, 22)])
+@pytest.mark.parametrize("preflight_indexer", [False, True])
+def test_decoder_seals_before_first_latent_transfer(
+    monkeypatch, layers, indexer_layers, preflight_indexer
+):
+    connector, caches, _, prepare = _destination_setup(monkeypatch, layers)
+    connector.dsa_two_groups = True
+    connector.runtime_kv_group_layer_counts = (layers, indexer_layers)
+    if preflight_indexer:
+        connector._group_layouts[1] = SimpleNamespace(num_layers=indexer_layers)
+        connector.num_layers = indexer_layers  # Last transfer/preflight was Group 1.
+    initialize = MagicMock(
+        side_effect=AssertionError("seal initialized transfer state")
+    )
+    monkeypatch.setattr(connector, "_lazy_initialize_buffer", initialize)
+    monkeypatch.setattr(connector, "initialize_kvcaches_ptr", initialize)
+    for name in ("to", "copy_", "cpu", "tolist", "item", "sum"):
+        monkeypatch.setattr(torch.Tensor, name, initialize)
+
+    binding = connector.seal_sparse_destination_layout(caches)
+    assert binding.kvcaches_ref is caches
+    assert connector.seal_sparse_destination_layout(list(caches)) is binding
+    assert 0 not in connector._group_layouts
+    with pytest.raises(ValueError, match="wrong layer count"):
+        connector.seal_sparse_destination_layout(caches[:-1])
+    initialize.assert_not_called()
+    prepare.assert_not_called()
+
+
+def test_seal_rejects_initialized_layout_disagreeing_with_runtime(monkeypatch):
+    connector, caches, _, _ = _destination_setup(monkeypatch)
+    connector.dsa_two_groups = True
+    connector.runtime_kv_group_layer_counts = (2, 1)
+    connector._group_layouts[0] = SimpleNamespace(num_layers=1)
+    with pytest.raises(ValueError):
+        connector.seal_sparse_destination_layout(caches)
+    assert getattr(connector, "_sealed_sparse_destination_layout", None) is None
+
+
+def test_seal_requires_runtime_counts_or_an_initialized_dsa_layout(monkeypatch):
+    connector, caches, _, _ = _destination_setup(monkeypatch)
+    connector.dsa_two_groups = True
+    with pytest.raises(RuntimeError, match="before the kv_group=0 layout"):
+        connector.seal_sparse_destination_layout(caches)
+    connector._group_layouts[0] = SimpleNamespace(num_layers=2)
+    connector.num_layers = 1  # A mirrored Group-1 count is not authoritative.
+    assert connector.seal_sparse_destination_layout(caches).kvcaches_ref is caches
+
+
+def test_factory_carries_runtime_cardinality_into_destination_seal(monkeypatch):
+    from lmcache.utils import EngineType
+    from lmcache_ascend.v1 import npu_connector as factory
+
+    connector, caches, _, _ = _destination_setup(monkeypatch, 3)
+    metadata = SimpleNamespace(worker_id=0, use_mla=True,
+                               runtime_kv_group_layer_counts=(3, 1))
+    config = SimpleNamespace(use_layerwise=True, enable_blending=False,
+                             dsa_two_groups=True, enable_npu_transfer_validation=True)
+    cpu_device = torch.device("cpu")
+    monkeypatch.setattr(factory, "need_gpu_interm_buffer", lambda _: False)
+    monkeypatch.setattr(factory, "configure_npu_content_diagnostics", lambda _: None)
+    monkeypatch.setattr(torch, "npu", SimpleNamespace(
+        device_count=lambda: 1, set_device=lambda _: None), raising=False)
+    monkeypatch.setattr(torch, "device", lambda _: cpu_device)
+    monkeypatch.setattr(VLLMPagedMemLayerwiseNPUConnector, "from_metadata",
+                        lambda *a, **kw: connector)
+    actual = factory.CreateNPUConnector(config, metadata, EngineType.VLLM)
+    assert actual is connector
+    assert actual.runtime_kv_group_layer_counts == (3, 1)
+    assert actual.seal_sparse_destination_layout(caches).kvcaches_ref is caches
 
 
 def test_sealed_destination_hit_does_not_walk_or_compare_layers(monkeypatch):
@@ -181,6 +256,7 @@ def test_sealed_destination_generators_forward_current_request_payloads(monkeypa
     connector.lmcache_chunk_size = 4
     connector._group_layouts = {
         0: SimpleNamespace(
+            num_layers=2,
             k_hidden_dims=1,
             v_hidden_dims=1,
             dsa_hidden_dims=0,

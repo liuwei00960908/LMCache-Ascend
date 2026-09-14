@@ -1718,6 +1718,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         self.lmcache_chunk_size = int(kwargs.get("chunk_size", 0))
         self.dsa_two_groups = kwargs.get("dsa_two_groups", False)
+        self.runtime_kv_group_layer_counts: Optional[tuple[int, ...]] = None
         self.enable_npu_transfer_validation = bool(
             kwargs.get("enable_npu_transfer_validation", True)
         )
@@ -2444,7 +2445,20 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         """
         if not self.enable_npu_transfer_validation:
             return None
-        if len(kvcaches_ref) != self._expected_group_layers(0):
+        # Sealing follows graph capture, before the first latent transfer may
+        # initialize its lazy layout. Use the already validated runtime count;
+        # the mirrored num_layers may describe the preflighted indexer group.
+        runtime_counts = self.runtime_kv_group_layer_counts
+        if runtime_counts is None:
+            expected_layers = self._expected_group_layers(0)
+        else:
+            expected_layers = runtime_counts[0]
+            initialized_layers = self.get_num_layers(0)
+            if initialized_layers is not None and initialized_layers != expected_layers:
+                raise ValueError(
+                    "Sparse destination layout disagrees with runtime layers"
+                )
+        if len(kvcaches_ref) != expected_layers:
             raise ValueError("Cannot seal sparse destinations with wrong layer count")
         signature = tuple(
             self._vllm_layer_cache_identity_signature(layer) for layer in kvcaches_ref
