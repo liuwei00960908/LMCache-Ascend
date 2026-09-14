@@ -8308,6 +8308,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     compact_handle_batch = self._make_shared_handle_batch(
                         pre_resolved_shared_mem_layers,
                         missing_keys,
+                        kv_group=kv_group,
                     )
                     if perf_enabled:
                         handle_batch_ms = elapsed_ms(handle_batch_started)
@@ -8409,6 +8410,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 compact_handle_batch = self._make_shared_handle_batch(
                     cached_mem_layers,
                     retrieve_keys,
+                    kv_group=kv_group,
                 )
                 if compact_handle_batch is None:
                     raise ValueError(
@@ -9316,6 +9318,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 batch = self._make_shared_handle_batch(
                     [[rank0_page] for _ in range(layout.num_layers_for_group(1))],
                     keys,
+                    kv_group=1,
                 )
                 if batch is None:
                     raise ValueError(

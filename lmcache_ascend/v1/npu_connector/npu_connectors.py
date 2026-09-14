@@ -5624,11 +5624,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             # Preserve the layerwise generator protocol while deliberately
             # skipping every CPU-to-NPU payload. The cache engine still
             # resolves, owns, and seals the complete CPU latent source.
-            self.initialize_kvcaches_ptr(**kwargs)
-            materialize_group = kwargs.get("kv_group", 0)
-            for _ in range(
-                self._expected_group_layers(materialize_group)
-            ):
+            kvcaches = kwargs.get("kvcaches")
+            num_layers = len(kvcaches) if kvcaches is not None else self.num_layers
+            for _ in range(num_layers):
                 yield
             yield
             yield

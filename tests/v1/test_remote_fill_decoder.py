@@ -614,8 +614,10 @@ class _FakeCapabilityEngine:
         return None
 
     def _make_shared_handle_batch(
-        self, memory_objs: list[list[Any]], keys: list[list[CacheEngineKey]]
+        self, memory_objs: list[list[Any]], keys: list[list[CacheEngineKey]],
+        *, kv_group: int,
     ) -> SharedHandleBatch:
+        assert kv_group == 1
         assert all(layer == [self._page] for layer in memory_objs)
         return SharedHandleBatch(
             shm_name="remote-fill-test",
@@ -760,6 +762,47 @@ def test_startup_rejects_group_layout_not_matching_decoder_metadata() -> None:
 
     with pytest.raises(ValueError, match="kv_group=0"):
         engine._validate_remote_fill_decoder_layout(incompatible)
+
+
+@pytest.mark.parametrize("counts", [(2, 2), (3, 1), (79, 22)])
+def test_group1_startup_compacts_using_its_physical_layer_count(
+    monkeypatch: pytest.MonkeyPatch, counts: tuple[int, int]
+) -> None:
+    """Exercise the real compactor, not a cardinality-blind startup double."""
+    import lmcache.v1.cache_engine as core_engine
+
+    page = _capability_page()
+    page.num_layers = counts[1]
+    page.size = page.layer_size * counts[1]
+    page.physical_size = max(64, page.size)
+    page.meta = page.metadata
+    monkeypatch.setattr(core_engine, "LayerPageMemoryObj", _FakeCapabilityPage)
+
+    def pin_many(pages: list[_FakeCapabilityPage]) -> bool:
+        for item in pages:
+            item.pins += 1
+        return True
+
+    monkeypatch.setattr(LayerPageMemoryObj, "pin_many", staticmethod(pin_many))
+    published = []
+
+    def broadcast(payload: Any, source_rank: int) -> Any:
+        if isinstance(payload, dict) and "batch" in payload:
+            published.append(payload)
+        return payload
+
+    engine = _FakeCapabilityEngine(rank=0, broadcast=broadcast, page=page)
+    engine.shared_cpu_cache_name = "remote-fill-test"
+    engine.num_layers_for_group = lambda group: counts[group]
+    engine._make_shared_handle_batch = LMCacheEngine._make_shared_handle_batch.__get__(
+        engine
+    )
+    layout = replace(_layout(), num_layers=counts[0], group_layer_counts=counts)
+    engine._preflight_remote_fill_shared_group1(layout, {})
+
+    assert engine._remote_fill_shared_group1_supported
+    assert len(published) == 1
+    assert page.refs == page.pins == 0
 
 
 def test_group1_shared_startup_fails_closed_on_passive_rank_rejection(

@@ -438,7 +438,8 @@ def test_cold_direct_indexer_cpu_fallback_reuses_layer_pages(monkeypatch) -> Non
 
     engine._resolve_shared_rank0_layer_pages = resolve_pages
 
-    def append_group(sources, owners, *_args):
+    def append_group(sources, owners, *_args, kv_group):
+        assert kv_group == 1
         owners.extend([[*source.pages, *source.suffix] for source in sources])
 
     engine._append_retrieve_group_cache = append_group
@@ -3005,7 +3006,8 @@ def test_sparse_passive_reuses_one_merged_page(
             isinstance(source, LayerPageSource)
             for source in engine.gpu_connector.sources
         )
-        assert engine.gpu_connector.append_kv_group == 0
+        if not early_active:
+            assert engine.gpu_connector.append_kv_group == 0
         assert cached_memory_objs == [[page], [page]]
         assert cached_chunk_dev_ptrs == [[11], [22]]
         assert [row.tolist() for row in cached_chunk_ptrs_npu] == [[11], [22]]
@@ -3054,18 +3056,28 @@ def test_sparse_passive_reuses_one_merged_page(
         assert "passive_compact_materialize" not in dict(perf_events)
 
 
-def test_materialize_only_npu_consumer_never_initializes_transfer_state() -> None:
+@pytest.mark.parametrize("group_layers", [None, 2, 22, 79])
+def test_materialize_only_npu_consumer_never_initializes_transfer_state(
+    group_layers,
+) -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.num_layers = 2
+    connector.initialize_kvcaches_ptr = MagicMock(
+        side_effect=AssertionError("CPU-only materialization initialized NPU state")
+    )
+    kwargs = {} if group_layers is None else {"kvcaches": [object()] * group_layers}
     consumer = connector.batched_to_gpu_head_token_wise(
-        materialize_only=True
+        materialize_only=True, **kwargs,
     )
 
     next(consumer)
-    consumer.send(object())
-    consumer.send(object())
+    for _ in range(2 if group_layers is None else group_layers):
+        consumer.send(object())
     next(consumer)
+    with pytest.raises(StopIteration):
+        next(consumer)
     consumer.close()
+    connector.initialize_kvcaches_ptr.assert_not_called()
 
 
 def test_dense_load_completion_api_synchronizes_the_load_stream() -> None:
@@ -3622,7 +3634,7 @@ def test_backend_compact_batch_skips_store_fence_and_finishes_once(
         chunk_hashes=[int(key.chunk_hash)],
         offsets=[0, 1],
     )
-    engine._make_shared_handle_batch = lambda *_args: batch
+    engine._make_shared_handle_batch = lambda *_args, **_kwargs: batch
     engine._broadcast_shared_envelope = lambda envelope: broadcasts.append(envelope)
     engine._fence_shared_cpu_store_publication = MagicMock()
     if exit_mode == "preflight_error":
@@ -4546,7 +4558,8 @@ def test_append_retrieve_group_forwards_deferred_pointer_copy():
     engine.num_layers = 1
     deferred = []
 
-    def append(_sources, host_ptrs, npu_ptrs, *, defer_copy=False):
+    def append(_sources, host_ptrs, npu_ptrs, *, defer_copy=False, kv_group):
+        assert kv_group == 0
         deferred.append(defer_copy)
         host_ptrs.append([11])
         npu_ptrs.append(torch.tensor([11]))
@@ -4561,6 +4574,7 @@ def test_append_retrieve_group_forwards_deferred_pointer_copy():
         [],
         [],
         defer_pointer_copy=True,
+        kv_group=0,
     )
 
     assert deferred == [True]
@@ -4847,6 +4861,7 @@ def test_sparse_pointer_cache_append_failure_is_atomic(monkeypatch):
 def test_sparse_pointer_cache_accepts_memory_obj_sources(monkeypatch):
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.num_layers = 1
+    connector.dsa_two_groups = False
     connector.kv_device = torch.device("cpu")
     monkeypatch.setattr(
         npu_connectors.lmc_ops,

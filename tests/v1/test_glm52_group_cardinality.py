@@ -260,7 +260,7 @@ def _store_layer_engine(group_layers: int):
     engine._shared_cpu_dtype_for_kv_group = lambda _g: torch.bfloat16
     engine._memory_format_for_kv_group = lambda _g: None
     engine._should_use_shared_layerwise_retrieve = lambda _g: False
-    engine._track_sync_store_futures = lambda futures: None
+    engine._track_sync_store_futures = lambda futures, **kwargs: None
     engine.store_location = "LocalCPUBackend"
     engine.retrieve_locations = ["LocalCPUBackend"]
     engine.token_database = SimpleNamespace(
