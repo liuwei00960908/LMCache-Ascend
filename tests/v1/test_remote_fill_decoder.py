@@ -4,7 +4,7 @@
 # Standard
 from collections import deque
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from threading import Event
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -30,6 +30,7 @@ from lmcache.v1.storage_backend.local_cpu_backend import (
     LayerPageAdmissionRollbackError,
 )
 import pytest
+import msgspec
 import torch
 
 # First Party
@@ -853,6 +854,7 @@ def _lifecycle(
     chunk_hash_type: type[int] | type[bytes] = int,
     chunk_hash_bytes: int | None = None,
     direct_groups: tuple[int, ...] = (0, 1),
+    layout: RemoteFillDecoderLayout | None = None,
 ) -> AscendRemoteFillPageLifecycle:
     def pin_pages(pages: list[_FakePage]) -> bool:
         for page in pages:
@@ -861,7 +863,7 @@ def _lifecycle(
 
     return AscendRemoteFillPageLifecycle(
         local_backend=local,
-        layout=_layout(),
+        layout=layout or _layout(),
         capacity_available=(
             capacity
             if callable(capacity)
@@ -2039,3 +2041,30 @@ def test_remote_fill_control_host_uses_existing_global_te_identity(
     session: str, host: str
 ) -> None:
     assert _remote_fill_advertise_host_from_session(session) == host
+
+
+def test_unequal_group_pages_allocate_and_publish_exact_bytes():
+    local = _FakeLocalBackend()
+    layout = replace(_layout(), group_layer_counts=(2, 1))
+    lifecycle = _lifecycle(local, layout=layout)
+    controls = tuple(
+        msgspec.structs.replace(
+            _control_page(chunk, group, valid_tokens=count),
+            layer_count=layout.num_layers_for_group(group),
+            expected_bytes=layout.group(group).expected_bytes(
+                count, layout.num_layers_for_group(group)
+            ),
+        )
+        for chunk, count in ((0, 4), (1, 2))
+        for group in (0, 1)
+    )
+    prepared = lifecycle.prepare_pages("transfer", 0, controls, True)
+    assert [item.destination_length for item in prepared] == [64, 16, 32, 8]
+    assert local.hot == {}
+    assert lifecycle.commit_pages(
+        "transfer", controls, _views(controls, prepared), _finish(6, partial=2)
+    )
+    assert len(local.hot) == 4
+    for call in local.allocations:
+        for page in call["pages"]:
+            assert page.refs == 1 and page.pins == 0
