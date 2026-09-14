@@ -114,6 +114,52 @@ def test_factory_carries_runtime_cardinality_into_destination_seal(monkeypatch):
     assert actual.seal_sparse_destination_layout(caches).kvcaches_ref is caches
 
 
+@pytest.mark.parametrize("layers,indexer_layers", [(2, 2), (79, 22)])
+def test_first_prepared_load_after_early_seal_initializes_only_latent_metadata(
+    monkeypatch, layers, indexer_layers
+):
+    connector, _, kwargs, prepare = _destination_setup(monkeypatch, layers)
+    caches = [
+        (torch.zeros(2, 4, 1, 512), torch.zeros(2, 4, 1, 64))
+        for _ in range(layers)
+    ]
+    connector.dsa_two_groups = connector.use_mla = True
+    connector.use_gpu = False
+    connector.lmcache_chunk_size = 4
+    connector.runtime_kv_group_layer_counts = (layers, indexer_layers)
+    indexer_layout = npu_connectors._GroupLayout()
+    indexer_layout.num_layers = indexer_layers
+    connector._group_layouts[1] = indexer_layout
+    connector._current_kv_group = 1
+    connector.num_layers = indexer_layers
+    binding = connector.seal_sparse_destination_layout(caches)
+    assert 0 not in connector._group_layouts
+    source = SimpleNamespace(
+        layers=[SimpleNamespace(chunk_ptrs_npu=torch.ones(1)) for _ in caches],
+        total_tokens=4, chunk_token_counts=(4,), validated_chunk_size=4,
+    )
+    signature = MagicMock(side_effect=AssertionError("sealed metadata was rebuilt"))
+    monkeypatch.setattr(connector, "_vllm_layer_cache_identity_signature", signature)
+    plans = []
+    for _ in range(2):
+        loader = connector.batched_to_gpu_head_token_wise(
+            prepared_sparse_source=source, kvcaches=caches,
+            slot_mapping=kwargs["slot_mapping_ref"],
+            registered_destination_layout=binding, kv_group=0, sync=False,
+        )
+        try:
+            next(loader)  # Prepare metadata; no layer payload is submitted.
+            plans.append(connector._sparse_destination_plans[0])
+        finally:
+            loader.close()
+    assert connector.get_num_layers(0) == layers
+    assert connector._group_layouts[0].gpu_buffer_allocator is None
+    assert connector._group_layouts[1] is indexer_layout
+    assert plans[0] is plans[1] and plans[0].binding is binding
+    assert prepare.call_count == layers
+    signature.assert_not_called()
+
+
 def test_sealed_destination_hit_does_not_walk_or_compare_layers(monkeypatch):
     connector, caches, kwargs, prepare = _destination_setup(monkeypatch, 79)
     comparisons = []
