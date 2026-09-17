@@ -26,6 +26,55 @@
 
 LMCache-Ascend is a community maintained plugin for running LMCache on the Ascend NPU.
 
+### Banked layerwise prefill storage
+
+With `VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE=true` and `use_layerwise: true`,
+P-node KV banks are reused across layers. All-layer NPU direct-store requests
+(including those enabled by `enable_remote_lmcache_store`) therefore log
+`[PREFILL_STORE_FALLBACK]` once per connector at startup and use the existing
+per-layer NPU-to-CPU save path. Each layer is copied before its bank is reused;
+the existing transfer/compute overlap is retained.
+
+Completed CPU LayerPages become locally readable immediately. Mooncake page
+puts run asynchronously across compute-prefill chunks, regardless of the old
+`store_async` choice. There is no per-layer or per-intermediate-forward remote
+barrier. Submission is bounded by `remote_fill_max_inflight_bytes` and twice
+`store_async_max_queue_size` (two KV groups; zero uses a two-compute-batch
+default). One oversized group batch is admitted only into an empty queue.
+Backpressure waits occur at batch boundaries, not at every layer. Legacy
+non-page storage retains its completion fence.
+
+With a live D handoff and `remote_fill_submission_mode: per_chunk`, existing
+RemoteFill can concurrently push leased CPU pages to D. It no longer reads P's
+reused NPU banks. Existing admission failure falls back to persistent loading;
+`final_deferred` also uses persistent loading rather than retaining all prompt
+pages for an extra deferred push. D's `persistent_direct_hbm` indexer reader
+is unchanged. Local-ready is not promoted to persistent progress until the
+final barrier succeeds. Failed puts forbid successful handoff; unknown DMA
+completion retains source pages and requires worker restart.
+
+The final P handoff waits for required Mooncake puts and any accepted RemoteFill
+jobs. Cancellation/preemption/close also fence outstanding puts. Normal non-P
+direct storage and default remote-before-local page publication are unchanged.
+
+This fallback still uses LocalCPU cache for continuation-prefill reloads.
+Per-layer NPU-to-Mooncake storage without LocalCPU cache is not implemented.
+
+Costs relative to the original all-layer NPU direct path:
+
+| Item | Cost / frequency |
+| --- | --- |
+| Local staging | One NPU-to-CPU copy per layer, already required for banked continuation-prefill; no second payload copy added |
+| Mooncake put | One CPU-page batch per KV group per compute-prefill chunk; starts after that chunk's D2H drain |
+| CPU fill, if D negotiated it | A second network destination (D LocalCPU) in addition to Mooncake persistence, just like the existing dual-destination design; not a second D2H |
+| Ownership/bookkeeping | One ref per page per active consumer, per-batch futures and a bounded queue scan; CPU fill borrows existing D2H events, but native preparation still checks those events |
+| Memory | CPU pages cannot be recycled before both readers finish; the persistence and RemoteFill queues have separate limits, not one combined byte budget; one producing/oversized batch can add to that |
+| Waiting | Queue-limit backpressure and final handoff/abort/close; existing local bank-reuse waits remain |
+
+No claim of a measured speedup is made without an NPU run. Asynchronous jobs
+can still contend for memory/network bandwidth, and final handoff can still
+wait when remote bandwidth cannot keep up with computation.
+
 
 ## Prerequisites
 

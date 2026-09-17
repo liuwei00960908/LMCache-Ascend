@@ -99,6 +99,10 @@ from lmcache_ascend.v1.direct_store_plan import (
     select_remote_fill_batch_pages,
 )
 from lmcache_ascend.v1.preemption_checkpoint import CheckpointWorker
+from lmcache_ascend.v1.layerwise_cpu_fill import (
+    LayerwiseCPUFillLease,
+    LayerwisePutQueue,
+)
 from lmcache_ascend.v1.remote_fill import (
     DecoderRemoteFillRuntime,
     RemoteFillDecoderLayout,
@@ -463,8 +467,15 @@ class AscendLMCacheEngine(LMCacheEngine):
             else None
         )
         self._require_store_completion = False
+        self._force_layerwise_prefill_store = bool(
+            self.config.use_layerwise
+            and os.getenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "false")
+            .strip()
+            .lower() == "true"
+        )
         self._direct_store_enabled = bool(
             self.is_store_async
+            and not self._force_layerwise_prefill_store
             and self.config.pd_role != "receiver"
             and (
                 self.config.get_extra_config_value(
@@ -478,6 +489,11 @@ class AscendLMCacheEngine(LMCacheEngine):
             and self.config.get_extra_config_value("use_ascend_direct", False)
         )
         self._direct_store_states: dict[str, _DirectStoreRequestState] = {}
+        self._layerwise_put_queue = None
+        self._layerwise_cpu_fill_sources: dict[
+            str, dict[int, tuple[_DirectPageBatch, LayerwiseCPUFillLease]]
+        ] = {}
+        self._layerwise_cpu_fill_quarantine: list[LayerwiseCPUFillLease] = []
         self._direct_store_jobs: deque[Future] = deque()
         self._direct_retry_args: dict[Future, tuple[Any, ...]] = {}
         self._direct_completed_futures: WeakSet[Future] = WeakSet()
@@ -614,7 +630,11 @@ class AscendLMCacheEngine(LMCacheEngine):
                     "Group-1 direct-HBM startup and rollback both failed"
                 ) from rollback_error
             raise
-        if self.is_store_async and not self._direct_store_enabled:
+        if (
+            self.is_store_async
+            and not self._direct_store_enabled
+            and not self._force_layerwise_prefill_store
+        ):
             self._device_id = torch.npu.current_device()
             self._ensure_store_worker()
             queue_mode = "unbounded" if self._store_queue_maxsize == 0 else "bounded"
@@ -913,6 +933,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
 
     def close_remote_fill_producer(self) -> None:
+        self.poll_layerwise_prefill_puts(final=True)
         coordinator = getattr(self, "_remote_fill_coordinator", None)
         if coordinator is not None:
             coordinator.close(
@@ -920,6 +941,11 @@ class AscendLMCacheEngine(LMCacheEngine):
                 for state in getattr(self, "_direct_store_states", {}).values()
                 if state.remote_fill is not None
             )
+        sources = getattr(self, "_layerwise_cpu_fill_sources", {})
+        for groups in sources.values():
+            for _, lease in groups.values():
+                lease.release()
+        sources.clear()
 
     def remote_fill_producer_metrics_snapshot(self) -> dict[str, Any]:
         coordinator = getattr(self, "_remote_fill_coordinator", None)
@@ -1562,6 +1588,161 @@ class AscendLMCacheEngine(LMCacheEngine):
         state.committed_end[group] = max(
             state.committed_end.get(group, 0), result.committed_end
         )
+
+    def poll_layerwise_prefill_puts(self, *, final: bool = False) -> None:
+        """Poll CPU-page persistence, or fence it before final handoff/teardown."""
+        queue = getattr(self, "_layerwise_put_queue", None)
+        if queue is not None:
+            queue.drain() if final else queue.poll()
+
+    def _queue_layerwise_cpu_fill(
+        self,
+        req_id: str,
+        request_configs: Optional[dict],
+        kv_group: int,
+        keys: list,
+        pages: list,
+        starts: list[int],
+        ends: list[int],
+    ) -> None:
+        """Retain fully D2H-fenced pages, without copying their payload.
+
+        Must run after draining the NPU storer and before backend submission
+        releases the original page references. This never revisits NPU banks.
+        """
+        if kv_group not in self._remote_fill_direct_groups():
+            return
+        state = self._direct_store_states.setdefault(req_id, _DirectStoreRequestState())
+        if not self._remote_fill_prepare_request(req_id, request_configs, state):
+            return
+        if state.remote_fill.disabled_reason:
+            return
+        if self.config.remote_fill_submission_mode != "per_chunk":
+            state.remote_fill.disabled_reason = "banked_prefill_final_deferred"
+            return
+        fences = self.gpu_connector.layerwise_prefill_store_fences(kv_group)
+        if not fences or not pages or not all(
+            isinstance(page, LayerPageMemoryObj) for page in pages
+        ):
+            state.remote_fill.disabled_reason = "banked_prefill_source_unavailable"
+            return
+        groups = self._layerwise_cpu_fill_sources.setdefault(req_id, {})
+        if kv_group in groups:
+            raise RuntimeError("Duplicate CPU fill group in one prefill batch")
+        lease = LayerwiseCPUFillLease(tuple(pages))
+        try:
+            owners = tuple({
+                int(page.raw_data.untyped_storage().data_ptr()): page.raw_data
+                for page in pages
+            }.values())
+            batch = _DirectPageBatch(
+                req_id=req_id,
+                keys=[key.without_layer() for key in keys],
+                # LayerPage is contiguous: one vector per chunk, not per layer.
+                ptrs=[[page.layer_data_ptr(0)] for page in pages],
+                sizes=[[page.get_size()] for page in pages],
+                owners=owners,
+                ready_event=fences[-1],
+                group_ends={kv_group: ends[-1]},
+                ranges=tuple(zip(starts, ends, strict=True)),
+                ready_events=fences,
+            )
+            groups[kv_group] = (batch, lease)
+        except BaseException:
+            lease.release()
+            raise
+
+    def submit_layerwise_prefill_fills(self, req_ids: Iterable[str]) -> None:
+        """Start CPU-to-D fill concurrently with already-submitted Mooncake puts.
+
+        Existing RemoteFill byte/window limits apply. Unsupported or unmatched
+        group pages retain the persistent fallback. No payload copy is added.
+        """
+        for req_id in req_ids:
+            groups = self._layerwise_cpu_fill_sources.pop(req_id, {})
+            if not groups:
+                continue
+            leases = tuple(lease for _, lease in groups.values())
+            state = self._direct_store_states[req_id]
+            previous = state.remote_fill.last_future
+            try:
+                if set(groups) != set(self._remote_fill_direct_groups()):
+                    state.remote_fill.disabled_reason = "banked_prefill_incomplete_groups"
+                    continue
+                batches = [batch for batch, _ in groups.values()]
+                if any(batch.ranges != batches[0].ranges for batch in batches[1:]):
+                    state.remote_fill.disabled_reason = "banked_prefill_unpaired_pages"
+                    continue
+                events = tuple({
+                    id(event): event
+                    for batch in batches for event in batch.ready_events
+                }.values())
+                batch = merge_deferred_remote_fill_batches(batches, events)
+                self._schedule_remote_fill_batch(
+                    state, batch, max(batch.group_ends.values())
+                )
+            finally:
+                submitted = state.remote_fill.last_future
+                if submitted is previous or submitted is None:
+                    for lease in leases:
+                        lease.release()
+                else:
+                    def release_sources(done: Future, held=leases) -> None:
+                        error = None if done.cancelled() else done.exception()
+                        if isinstance(error, RemoteFillFatalError):
+                            # Unknown native completion: do not recycle DMA
+                            # sources. The existing fatal path restarts workers.
+                            self._layerwise_cpu_fill_quarantine.extend(held)
+                            return
+                        for lease in held:
+                            lease.release()
+
+                    submitted.add_done_callback(release_sources)
+
+    def finish_layerwise_prefill_store(
+        self,
+        req_id: str,
+        request_configs: Optional[dict],
+        *,
+        required_store_end: int,
+        persistence_fenced: bool = False,
+    ) -> None:
+        """Publish the terminal handoff after banked layerwise saves.
+
+        The adapter adopts each completed group via
+        ``adopt_completed_layerwise_store`` before calling this method. Native
+        fill jobs read leased CPU pages, never overwritten NPU banks.
+        persistence_fenced requires a successful final poll and sync-store wait
+        with no intervening store submission (avoids duplicate batch fences).
+        Passive TP workers and requests without RemoteFill remain unchanged.
+
+        Raises:
+            RuntimeError: Either KV group's persisted frontier is incomplete.
+            TimeoutError: Required remote puts have not completed in time.
+        """
+        if not self.config.enable_remote_lmcache_store or self._is_passive():
+            return
+        if not persistence_fenced:
+            self.poll_layerwise_prefill_puts(final=True)
+            self.wait_for_pending_sync_stores()
+        state = self._direct_store_states.setdefault(
+            req_id, _DirectStoreRequestState()
+        )
+        self._remote_fill_prepare_request(req_id, request_configs, state)
+        if state.remote_fill is None or state.remote_fill.handoff is None:
+            return
+        persistent_end = min(state.committed_end.get(group, 0) for group in (0, 1))
+        if persistent_end < required_store_end:
+            raise RuntimeError(
+                "Layerwise prefill persistence is incomplete; refusing "
+                f"RemoteFill handoff: req_id={req_id}, "
+                f"committed={state.committed_end}, required={required_store_end}"
+            )
+        if state.remote_fill.last_future is None and state.remote_fill.session is None:
+            state.remote_fill.disabled_reason = (
+                state.remote_fill.disabled_reason or "layerwise_prefill_persistent_only"
+            )
+        self._finish_remote_fill(req_id, state, required_store_end)
 
     def _track_direct_batch(
         self,
@@ -3368,6 +3549,9 @@ class AscendLMCacheEngine(LMCacheEngine):
 
     def wait_for_direct_stores(self, req_ids: Iterable[str]) -> set[str]:
         """Fence request-owned direct puts before vLLM may release KV blocks."""
+        req_ids = tuple(req_ids)
+        if req_ids and getattr(self, "_force_layerwise_prefill_store", False):
+            self.poll_layerwise_prefill_puts(final=True)
         waited: set[str] = set()
         for req_id in req_ids:
             state = self._direct_store_states.get(req_id)
@@ -3557,6 +3741,9 @@ class AscendLMCacheEngine(LMCacheEngine):
     def drop_direct_store_states(self, req_ids: Iterable[str]) -> None:
         """Forget completed request bookkeeping after vLLM releases ownership."""
         for req_id in req_ids:
+            sources = getattr(self, "_layerwise_cpu_fill_sources", {})
+            for _, lease in sources.pop(req_id, {}).values():
+                lease.release()
             state = self._direct_store_states.get(req_id)
             if state is not None:
                 releasable = not state.futures and not state.pending_keys
@@ -6604,6 +6791,30 @@ class AscendLMCacheEngine(LMCacheEngine):
                             publish_completed_layer(layer_id)
 
                 if page_first_store:
+                    async_pages = bool(
+                        self._force_layerwise_prefill_store
+                        and page_store
+                        and str(self.config.remote_url or "").startswith("mooncakestore://")
+                        and all(isinstance(obj, LayerPageMemoryObj) for obj in memory_objs[0])
+                    )
+                    batch_bytes = sum(obj.get_size() for obj in memory_objs[0]) if async_pages else 0
+                    if async_pages:
+                        if self._layerwise_put_queue is None:
+                            self._layerwise_put_queue = LayerwisePutQueue(
+                                max_bytes=int(self.config.remote_fill_max_inflight_bytes),
+                                # A compute batch produces one put per DSA group.
+                                max_batches=2 * (self._store_queue_maxsize or 2),
+                                timeout=float(self.config.blocking_timeout_secs),
+                            )
+                        self._layerwise_put_queue.reserve(batch_bytes)
+                    if (
+                        self._force_layerwise_prefill_store
+                        and self.config.enable_remote_lmcache_store
+                    ):
+                        self._queue_layerwise_cpu_fill(
+                            req_id, request_configs, kv_group,
+                            keys[0], memory_objs[0], starts, ends,
+                        )
                     if page_store:
                         page_indices = [
                             index
@@ -6621,8 +6832,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                             layer_pages = [
                                 memory_objs[0][index] for index in page_indices
                             ]
-                            required_futures.extend(
-                                self.storage_manager.batched_put_layer_pages(
+                            try:
+                                page_futures = self.storage_manager.batched_put_layer_pages(
                                     [
                                         keys[0][index].without_layer()
                                         for index in page_indices
@@ -6630,8 +6841,13 @@ class AscendLMCacheEngine(LMCacheEngine):
                                     layer_pages,
                                     location=self.store_location,
                                     req_id=req_id,
+                                    publish_local_early=async_pages,
                                 )
-                            )
+                            except Exception as error:
+                                if async_pages:
+                                    self._layerwise_put_queue.fail(error)
+                                raise
+                            required_futures.extend(page_futures)
                             submitted_objs.extend(layer_pages)
                             for page in layer_pages:
                                 pending_store_release.pop(id(page), None)
@@ -6666,9 +6882,12 @@ class AscendLMCacheEngine(LMCacheEngine):
                             submitted_objs,
                             location=self.store_location,
                         )
-                    self._track_sync_store_futures(
-                        required_futures, require_completion=True
-                    )
+                    if async_pages:
+                        self._layerwise_put_queue.add(batch_bytes, required_futures)
+                    else:
+                        self._track_sync_store_futures(
+                            required_futures, require_completion=True
+                        )
                     for mem_obj in submitted_objs:
                         pending_store_release.pop(id(mem_obj), None)
 
