@@ -6,6 +6,7 @@ its storage. This lease owns MemoryObj references, not another payload copy.
 """
 
 from collections import deque
+from collections.abc import Iterable
 from concurrent.futures import Future, wait
 from threading import Lock
 from time import monotonic
@@ -60,6 +61,8 @@ class LayerwisePutQueue:
         self.pending: deque[tuple[int, tuple[Future, ...]]] = deque()
         self.pending_bytes = 0
         self.error: BaseException | None = None
+        self._request_futures: dict[str, set[Future]] = {}
+        self._key_futures: dict[Any, set[Future]] = {}
 
     def fail(self, error: BaseException) -> None:
         """Latch synchronous submission failures as well as future failures."""
@@ -75,11 +78,13 @@ class LayerwisePutQueue:
         try:
             remaining = deque()
             remaining_bytes = 0
+            completed = set()
             for size, futures in self.pending:
                 done = True
                 for future in futures:
                     if future.done():
                         future.result()
+                        completed.add(future)
                     else:
                         done = False
                 if not done:
@@ -87,6 +92,15 @@ class LayerwisePutQueue:
                     remaining_bytes += size
             self.pending = remaining
             self.pending_bytes = remaining_bytes
+            if not completed:
+                return
+            # Only outstanding transfers need dependency bookkeeping. No page
+            # payloads or permanent per-request key history are retained here.
+            for dependencies in (self._request_futures, self._key_futures):
+                for key, futures in list(dependencies.items()):
+                    futures.difference_update(completed)
+                    if not futures:
+                        del dependencies[key]
         except BaseException as error:
             self.error = error
             raise
@@ -101,14 +115,51 @@ class LayerwisePutQueue:
         ):
             self._wait_first(deadline)
 
-    def add(self, size: int, futures: list[Future]) -> None:
+    def add(
+        self,
+        size: int,
+        futures: list[Future],
+        *,
+        req_id: str = "",
+        keys: Iterable[Any] = (),
+    ) -> None:
         """Track a submitted put; its caller must first reserve this capacity."""
         if futures:
             self.pending.append((size, tuple(futures)))
             self.pending_bytes += size
+            if req_id:
+                self._request_futures.setdefault(req_id, set()).update(futures)
+            for key in keys:
+                self._key_futures.setdefault(key, set()).update(futures)
+
+    def track_keys(self, req_id: str, keys: Iterable[Any]) -> None:
+        """Inherit unfinished puts when reusing locally published CPU pages.
+
+        Called at chunk enumeration, not per layer. Reuses already generated
+        cache keys, so it neither rehashes the prompt nor waits for a transfer.
+        """
+        if not req_id or not self._key_futures:
+            return
+        for key in keys:
+            futures = self._key_futures.get(key)
+            if futures:
+                self._request_futures.setdefault(req_id, set()).update(futures)
+
+    def drain_requests(self, req_ids: Iterable[str]) -> None:
+        """Fence these requests and reused-prefix puts, not unrelated requests."""
+        self.poll()
+        futures = set()
+        for req_id in req_ids:
+            futures.update(self._request_futures.get(req_id, ()))
+        if futures:
+            _, pending = wait(futures, timeout=self.timeout)
+            if pending:
+                self.error = TimeoutError("Layerwise CPU remote puts did not complete")
+                raise self.error
+        self.poll()
 
     def drain(self) -> None:
-        """Fence all pending puts before handoff, abort or allocator teardown."""
+        """Fence all pending puts before allocator teardown."""
         self.poll()
         deadline = monotonic() + self.timeout
         while self.pending:

@@ -1164,9 +1164,10 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         if self.kv_role == "kv_consumer" or self.lmcache_engine is None:
             return
         metadata = self._parent._get_connector_metadata()
-        final = any(
-            request.is_last_prefill and not request.is_sparse_decode
+        final_requests = tuple(
+            request
             for request in metadata.requests
+            if request.is_last_prefill and not request.is_sparse_decode
         )
         try:
             # Both groups' CPU pages now exist. Start the independent D-cache
@@ -1174,7 +1175,10 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             self.lmcache_engine.submit_layerwise_prefill_fills(
                 request.req_id for request in metadata.requests
             )
-            self.lmcache_engine.poll_layerwise_prefill_puts(final=final)
+            self.lmcache_engine.poll_layerwise_prefill_puts(
+                final=bool(final_requests),
+                req_ids=tuple(request.req_id for request in final_requests),
+            )
             # Only legacy/non-page fallback puts land in this set. Normal
             # Mooncake CPU-page puts use the bounded asynchronous queue above.
             self.lmcache_engine.wait_for_pending_sync_stores()
@@ -1185,22 +1189,22 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         if pending is None:
             pending = self._layerwise_local_store_results = {}
         pending.update(completed)
-        if not final:
+        if not final_requests:
             return
         # Local completion is deliberately NOT adopted as persistent progress
-        # until the final remote barrier succeeds. Global drain also covers
-        # requests sharing a locally-ready prefix from an earlier batch.
-        completed, self._layerwise_local_store_results = pending, {}
-        for result in completed.values():
-            self.lmcache_engine.adopt_completed_layerwise_store(result)
-        for request in metadata.requests:
-            if request.is_last_prefill and not request.is_sparse_decode:
-                self.lmcache_engine.finish_layerwise_prefill_store(
-                    request.req_id,
-                    request.request_configs,
-                    required_store_end=len(request.token_ids),
-                    persistence_fenced=True,
-                )
+        # until its remote barrier (including reused-prefix dependencies)
+        # succeeds. Other requests may still have remote puts in flight.
+        for request in final_requests:
+            for group in (0, 1):
+                result = pending.pop((request.req_id, group), None)
+                if result is not None:
+                    self.lmcache_engine.adopt_completed_layerwise_store(result)
+            self.lmcache_engine.finish_layerwise_prefill_store(
+                request.req_id,
+                request.request_configs,
+                required_store_end=len(request.token_ids),
+                persistence_fenced=True,
+            )
 
     def _finish_save_batch(self, _save_context: dict[str, Any]) -> None:
         if getattr(self, "_force_layerwise_prefill_store", False):
@@ -1390,7 +1394,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         req_ids = tuple(req_ids)
         if req_ids and getattr(self, "_force_layerwise_prefill_store", False):
             # Cancellation may happen before the normal final-prefill fence.
-            self.lmcache_engine.poll_layerwise_prefill_puts(final=True)
+            self.lmcache_engine.poll_layerwise_prefill_puts(final=True, req_ids=req_ids)
             self._forget_layerwise_store_results(req_ids)
         super()._release_finished_worker_requests(req_ids)
 
@@ -1488,7 +1492,9 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         if self.lmcache_engine is None:
             return
         if preempted_req_ids and getattr(self, "_force_layerwise_prefill_store", False):
-            self.lmcache_engine.poll_layerwise_prefill_puts(final=True)
+            self.lmcache_engine.poll_layerwise_prefill_puts(
+                final=True, req_ids=preempted_req_ids
+            )
             self._forget_layerwise_store_results(preempted_req_ids)
         worker = getattr(self.lmcache_engine, "checkpoint_worker", None)
         metadata = (

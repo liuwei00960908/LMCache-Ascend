@@ -168,6 +168,8 @@ def _slice_layerwise_slot_mapping(
     starts: Sequence[int],
     ends: Sequence[int],
     slot_mapping_base: int = 0,
+    *,
+    allow_view: bool = False,
 ) -> tuple[list[torch.Tensor], torch.Tensor]:
     if len(starts) != len(ends):
         raise ValueError(
@@ -193,8 +195,47 @@ def _slice_layerwise_slot_mapping(
         chunks.append(slot_mapping[local_start:local_end])
     if not chunks:
         return chunks, slot_mapping.new_empty((0,))
-    full = chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=0)
+    if len(chunks) == 1:
+        return chunks, chunks[0]
+    # The normal prefill prefix is contiguous; a view avoids a device cat and
+    # allocation. Disjoint selected ranges still require concatenation.
+    contiguous = allow_view and all(
+        left == right for left, right in zip(ends[:-1], starts[1:], strict=True)
+    )
+    full = (
+        slot_mapping[starts[0] - slot_mapping_base : ends[-1] - slot_mapping_base]
+        if contiguous else torch.cat(chunks, dim=0)
+    )
     return chunks, full
+
+
+def _cached_layerwise_slot_mapping(
+    cache: Optional[dict],
+    slot_mapping: torch.Tensor,
+    starts: Sequence[int],
+    ends: Sequence[int],
+    slot_mapping_base: int = 0,
+) -> tuple[list[torch.Tensor], torch.Tensor, bool]:
+    """Reuse immutable bank maps within ONE transfer generator/forward.
+
+    Ranges are fixed for the generator. Retain the input owner to prevent id
+    reuse. The next forward gets a fresh cache, even if tensor addresses repeat.
+    No tensor-content scan or host/device synchronization is needed.
+    """
+    if cache is None:
+        chunks, full = _slice_layerwise_slot_mapping(
+            slot_mapping, starts, ends, slot_mapping_base
+        )
+        return chunks, full, True
+    key = (id(slot_mapping), slot_mapping_base)
+    cached = cache.get(key)
+    if cached is not None:
+        return cached[1], cached[2], False
+    chunks, full = _slice_layerwise_slot_mapping(
+        slot_mapping, starts, ends, slot_mapping_base, allow_view=True
+    )
+    cache[key] = (slot_mapping, chunks, full)
+    return chunks, full, True
 
 
 def _payload_event_list(payload_event: Any) -> list[Any]:
@@ -5419,7 +5460,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             chunk_sizes.append(chunk_size)
             current_offset += chunk_size
 
-        _, slot_mapping_full = _slice_layerwise_slot_mapping(
+        slot_mappings = {} if deferred_layerwise_get else None
+        _, slot_mapping_full, _ = _cached_layerwise_slot_mapping(
+            slot_mappings,
             slot_mapping,
             starts,
             ends,
@@ -5516,26 +5559,28 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         slot_mapping,
                     )
                 )
-                layer_slot_mapping_chunks, layer_slot_mapping_full = (
-                    _slice_layerwise_slot_mapping(
+                layer_slot_mapping_chunks, layer_slot_mapping_full, new_mapping = (
+                    _cached_layerwise_slot_mapping(
+                        slot_mappings,
                         layer_slot_mapping,
                         starts,
                         ends,
                         layer_slot_mapping_base,
                     )
                 )
-                if len(layer_slot_mapping_full) != num_tokens:
+                if new_mapping and len(layer_slot_mapping_full) != num_tokens:
                     raise RuntimeError(
                         "Layerwise retrieve changed transfer token count: "
                         f"layer={layer_id}, expected={num_tokens}, "
                         f"actual={len(layer_slot_mapping_full)}"
                     )
-                self._check_layerwise_transfer_invariants(
-                    operation="retrieve",
-                    kv_group=kv_group,
-                    slot_mapping_full=layer_slot_mapping_full,
-                    kvcaches_ref=kvcaches_snapshot,
-                )
+                if new_mapping:
+                    self._check_layerwise_transfer_invariants(
+                        operation="retrieve",
+                        kv_group=kv_group,
+                        slot_mapping_full=layer_slot_mapping_full,
+                        kvcaches_ref=kvcaches_snapshot,
+                    )
                 source_objs = _layer_source_memory_objs(memory_objs_layer, layer_id)
                 page_checks: tuple[MemoryObj, ...] = ()
                 format_sources = source_objs
@@ -6659,7 +6704,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             chunk_sizes.append(chunk_size)
             current_offset += chunk_size
 
-        _, slot_mapping_full = _slice_layerwise_slot_mapping(
+        deferred_layerwise_put = bool(kwargs.get("deferred_layerwise_put", False))
+        slot_mappings = {} if deferred_layerwise_put else None
+        _, slot_mapping_full, _ = _cached_layerwise_slot_mapping(
+            slot_mappings,
             slot_mapping,
             starts,
             ends,
@@ -6791,9 +6839,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         store_transfer_pending = False
         try:
-            deferred_layerwise_put = bool(
-                kwargs.get("deferred_layerwise_put", False)
-            )
             layerwise_prefill_bank_count = int(
                 kwargs.get("layerwise_prefill_bank_count", 2) or 2
             )
@@ -6957,26 +7002,28 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         slot_mapping_base,
                     )
                 )
-                layer_slot_mapping_chunks, layer_slot_mapping_full = (
-                    _slice_layerwise_slot_mapping(
+                layer_slot_mapping_chunks, layer_slot_mapping_full, new_mapping = (
+                    _cached_layerwise_slot_mapping(
+                        slot_mappings,
                         layer_slot_mapping,
                         starts,
                         ends,
                         layer_slot_mapping_base,
                     )
                 )
-                if len(layer_slot_mapping_full) != num_tokens:
+                if new_mapping and len(layer_slot_mapping_full) != num_tokens:
                     raise RuntimeError(
                         "Layerwise store changed transfer token count: "
                         f"layer={layer_id}, expected={num_tokens}, "
                         f"actual={len(layer_slot_mapping_full)}"
                     )
-                self._check_layerwise_transfer_invariants(
-                    operation="store",
-                    kv_group=kv_group,
-                    slot_mapping_full=layer_slot_mapping_full,
-                    kvcaches_ref=kvcaches_snapshot,
-                )
+                if new_mapping:
+                    self._check_layerwise_transfer_invariants(
+                        operation="store",
+                        kv_group=kv_group,
+                        slot_mapping_full=layer_slot_mapping_full,
+                        kvcaches_ref=kvcaches_snapshot,
+                    )
                 memory_objs_layer = memory_objs[layer_id]
                 # kvcaches -> gpu_buffer -> memobj
                 # Mark before launching so exception cleanup also fences a

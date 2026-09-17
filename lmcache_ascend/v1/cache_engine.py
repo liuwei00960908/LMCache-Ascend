@@ -1589,11 +1589,40 @@ class AscendLMCacheEngine(LMCacheEngine):
             state.committed_end.get(group, 0), result.committed_end
         )
 
-    def poll_layerwise_prefill_puts(self, *, final: bool = False) -> None:
+    def poll_layerwise_prefill_puts(
+        self, *, final: bool = False, req_ids: Optional[Iterable[str]] = None
+    ) -> None:
         """Poll CPU-page persistence, or fence it before final handoff/teardown."""
         queue = getattr(self, "_layerwise_put_queue", None)
         if queue is not None:
-            queue.drain() if final else queue.poll()
+            if not final:
+                queue.poll()
+            elif req_ids is None:
+                queue.drain()
+            else:
+                queue.drain_requests(req_ids)
+
+    def _dense_retrieve_token_results(
+        self,
+        tokens: Union[torch.Tensor, list[int]],
+        mask: Optional[torch.Tensor],
+        request_configs: Optional[dict],
+        kv_group: int,
+        kwargs: dict[str, Any],
+    ) -> Iterable[tuple[int, int, CacheEngineKey]]:
+        results = super()._dense_retrieve_token_results(
+            tokens, mask, request_configs, kv_group, kwargs
+        )
+        queue = getattr(self, "_layerwise_put_queue", None)
+        if queue is None:
+            return results
+
+        def track_prefix():
+            for start, end, key in results:
+                queue.track_keys(kwargs.get("req_id", ""), (key,))
+                yield start, end, key
+
+        return track_prefix()
 
     def _queue_layerwise_cpu_fill(
         self,
@@ -1723,7 +1752,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         if not self.config.enable_remote_lmcache_store or self._is_passive():
             return
         if not persistence_fenced:
-            self.poll_layerwise_prefill_puts(final=True)
+            self.poll_layerwise_prefill_puts(final=True, req_ids=(req_id,))
             self.wait_for_pending_sync_stores()
         state = self._direct_store_states.setdefault(
             req_id, _DirectStoreRequestState()
@@ -3551,7 +3580,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         """Fence request-owned direct puts before vLLM may release KV blocks."""
         req_ids = tuple(req_ids)
         if req_ids and getattr(self, "_force_layerwise_prefill_store", False):
-            self.poll_layerwise_prefill_puts(final=True)
+            self.poll_layerwise_prefill_puts(final=True, req_ids=req_ids)
         waited: set[str] = set()
         for req_id in req_ids:
             state = self._direct_store_states.get(req_id)
@@ -6334,6 +6363,9 @@ class AscendLMCacheEngine(LMCacheEngine):
             requested_end = end
 
             keys_multi_layer = key.split_layers(num_layers)
+            if self._layerwise_put_queue is not None:
+                # A local hit can precede its producer's remote persistence.
+                self._layerwise_put_queue.track_keys(req_id, (key,))
             if self._layerwise_chunk_fully_stored(
                 keys_multi_layer,
                 req_id=req_id,
@@ -6883,7 +6915,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                             location=self.store_location,
                         )
                     if async_pages:
-                        self._layerwise_put_queue.add(batch_bytes, required_futures)
+                        self._layerwise_put_queue.add(
+                            batch_bytes, required_futures, req_id=req_id,
+                            keys=(key.without_layer() for key in keys[0]),
+                        )
                     else:
                         self._track_sync_store_futures(
                             required_futures, require_completion=True

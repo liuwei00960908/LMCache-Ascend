@@ -53,8 +53,10 @@ is unchanged. Local-ready is not promoted to persistent progress until the
 final barrier succeeds. Failed puts forbid successful handoff; unknown DMA
 completion retains source pages and requires worker restart.
 
-The final P handoff waits for required Mooncake puts and any accepted RemoteFill
-jobs. Cancellation/preemption/close also fence outstanding puts. Normal non-P
+The final P handoff waits for that request's Mooncake puts (including unfinished
+puts for reused local prefix pages) and its accepted RemoteFill jobs. It does not
+drain unrelated requests' puts. Cancellation/preemption use the same scoped fence;
+engine close still drains everything. Normal non-P
 direct storage and default remote-before-local page publication are unchanged.
 
 This fallback still uses LocalCPU cache for continuation-prefill reloads.
@@ -67,7 +69,7 @@ Costs relative to the original all-layer NPU direct path:
 | Local staging | One NPU-to-CPU copy per layer, already required for banked continuation-prefill; no second payload copy added |
 | Mooncake put | One CPU-page batch per KV group per compute-prefill chunk; starts after that chunk's D2H drain |
 | CPU fill, if D negotiated it | A second network destination (D LocalCPU) in addition to Mooncake persistence, just like the existing dual-destination design; not a second D2H |
-| Ownership/bookkeeping | One ref per page per active consumer, per-batch futures and a bounded queue scan; CPU fill borrows existing D2H events, but native preparation still checks those events |
+| Ownership/bookkeeping | One ref per page per active consumer, per-batch futures and a bounded queue scan; outstanding page-key/request dependencies reuse existing keys without rehashing prompts; CPU fill borrows existing D2H events, but native preparation still checks those events |
 | Memory | CPU pages cannot be recycled before both readers finish; the persistence and RemoteFill queues have separate limits, not one combined byte budget; one producing/oversized batch can add to that |
 | Waiting | Queue-limit backpressure and final handoff/abort/close; existing local bank-reuse waits remain |
 

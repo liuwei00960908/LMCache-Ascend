@@ -209,7 +209,11 @@ def test_step_finalization_fences_persistence_before_handoff(monkeypatch, final)
     )
     obj._completed_layerwise_stores = {("r", 0): "latent", ("r", 1): "index"}
     obj._finish_save_batch({})
-    expected = [("fill", ["r"]), ("poll", {"final": final}), "wait"]
+    expected = [
+        ("fill", ["r"]),
+        ("poll", {"final": final, "req_ids": ("r",) if final else ()}),
+        "wait",
+    ]
     if final:
         expected.extend(["latent", "index"])
         expected.append(
@@ -236,6 +240,27 @@ def test_remote_put_failure_never_publishes_handoff(monkeypatch):
     assert obj._completed_layerwise_stores == {}
 
 
+def test_final_request_does_not_adopt_other_requests_local_progress(monkeypatch):
+    obj, request = adapter(monkeypatch, remote=True)
+    request.is_last_prefill = True
+    adopted = []
+    obj.lmcache_engine = NS(
+        submit_layerwise_prefill_fills=lambda ids: None,
+        poll_layerwise_prefill_puts=lambda **kw: None,
+        wait_for_pending_sync_stores=lambda: None,
+        adopt_completed_layerwise_store=adopted.append,
+        finish_layerwise_prefill_store=lambda *a, **kw: None,
+    )
+    obj._completed_layerwise_stores = {
+        ("r", 0): "latent-with-mtp",
+        ("r", 1): "index-with-mtp",
+    }
+    obj._layerwise_local_store_results = {("unfinished", 0): "local-only"}
+    obj._finish_save_batch({})
+    assert adopted == ["latent-with-mtp", "index-with-mtp"]
+    assert obj._layerwise_local_store_results == {("unfinished", 0): "local-only"}
+
+
 def test_banked_placement_is_installed_before_generators_create_keys(monkeypatch):
     obj, request = adapter(monkeypatch, remote=True)
     obj.lmcache_engine.poll_layerwise_prefill_puts = lambda: None
@@ -257,7 +282,7 @@ def test_cancelled_request_is_fenced_before_its_local_progress_is_dropped(monkey
     calls = []
     obj.lmcache_engine.poll_layerwise_prefill_puts = lambda **kw: calls.append(kw)
     obj._release_finished_worker_requests(["r"])
-    assert calls == [{"final": True}]
+    assert calls == [{"final": True, "req_ids": ("r",)}]
     assert obj._layerwise_local_store_results == {("other", 1): "keep"}
     assert obj.released == ("r",)
 

@@ -169,6 +169,106 @@ class UnknownTransfer(RuntimeError):
     pass
 
 
+def test_request_barrier_does_not_wait_for_other_requests(monkeypatch):
+    queue = Queue(100, 4, 1)
+    first, other = Future(), Future()
+    queue.add(20, [first], req_id="a", keys=("prefix-a",))
+    queue.add(30, [other], req_id="b", keys=("prefix-b",))
+
+    def complete(futures, timeout):
+        assert set(futures) == {first}
+        first.set_result(None)
+        return {first}, set()
+
+    monkeypatch.setattr(module, "wait", complete)
+    queue.drain_requests(("a",))
+    assert not other.done()
+    assert queue.pending_bytes == 30
+    # A second cancellation/retirement call is nonblocking.
+    monkeypatch.setattr(module, "wait", lambda *a, **k: pytest.fail("duplicate wait"))
+    queue.drain_requests(("a",))
+
+
+@pytest.mark.parametrize("own_put", [False, True])
+def test_reused_local_prefix_inherits_only_required_remote_puts(monkeypatch, own_put):
+    queue = Queue(100, 8, 1)
+    prefix, unrelated, own = Future(), Future(), Future()
+    queue.add(10, [prefix], req_id="producer", keys=("shared",))
+    queue.add(10, [unrelated], req_id="producer", keys=("unshared",))
+    queue.track_keys("consumer", ("shared", "already-persisted"))
+    queue.track_keys("consumer", ("shared",))  # repeated layer/group reuse
+    expected = {prefix}
+    if own_put:
+        queue.add(10, [own], req_id="consumer", keys=("suffix",))
+        expected.add(own)
+
+    def complete(futures, timeout):
+        assert set(futures) == expected
+        for future in futures:
+            future.set_result(None)
+        return set(futures), set()
+
+    monkeypatch.setattr(module, "wait", complete)
+    queue.drain_requests(("consumer",))
+    assert not unrelated.done()
+    assert queue.pending_bytes == 10
+
+
+def test_request_barrier_propagates_reused_prefix_failure():
+    queue = Queue(100, 4, 0)
+    prefix = Future()
+    queue.add(10, [prefix], req_id="producer", keys=("shared",))
+    queue.track_keys("consumer", ("shared",))
+    prefix.set_exception(ValueError("shared remote put failed"))
+    with pytest.raises(ValueError, match="shared remote put failed"):
+        queue.drain_requests(("consumer",))
+
+
+def test_queue_poll_checks_each_batch_future_not_each_page_key():
+    class CountedFuture(Future):
+        checks = 0
+
+        def done(self):
+            self.checks += 1
+            return super().done()
+
+    future = CountedFuture()
+    queue = Queue(100, 4, 0)
+    queue.add(10, [future], req_id="r", keys=range(1024))
+    queue.poll()
+    assert future.checks == 1
+    future.set_result(None)
+    queue.poll()
+    assert future.checks == 2
+    assert not queue.pending
+
+
+def test_dense_retrieve_tracks_existing_keys_without_rehashing():
+    calls = []
+
+    class Base:
+        def _dense_retrieve_token_results(self, *args):
+            calls.append(args)
+            return iter(((0, 4, "shared"), (4, 8, "ready")))
+
+    cls = production_class(
+        ROOT / "lmcache_ascend/v1/cache_engine.py",
+        "AscendLMCacheEngine",
+        {"_dense_retrieve_token_results"},
+        {},
+        base=Base,
+    )
+    obj = cls()
+    queue = obj._layerwise_put_queue = Queue(100, 4, 0)
+    prefix = Future()
+    queue.add(10, [prefix], req_id="producer", keys=("shared",))
+    rows = obj._dense_retrieve_token_results([], None, {}, 1, {"req_id": "consumer"})
+    assert list(rows) == [(0, 4, "shared"), (4, 8, "ready")]
+    assert len(calls) == 1
+    with pytest.raises(TimeoutError):
+        queue.drain_requests(("consumer",))
+
+
 class Local:
     use_hot = True
 

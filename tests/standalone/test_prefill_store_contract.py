@@ -139,6 +139,7 @@ def test_real_deferred_store_generator_with_cpu_streams(monkeypatch, kv_group):
         in {
             "_resolve_layerwise_slot_mapping",
             "_slice_layerwise_slot_mapping",
+            "_cached_layerwise_slot_mapping",
             "_layer_memory_tensor",
         }
     ]
