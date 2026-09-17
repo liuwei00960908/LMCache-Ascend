@@ -1735,6 +1735,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         *,
         required_store_end: int,
         persistence_fenced: bool = False,
+        tokens: Optional[list[int]] = None,
     ) -> None:
         """Publish the terminal handoff after banked layerwise saves.
 
@@ -1744,6 +1745,10 @@ class AscendLMCacheEngine(LMCacheEngine):
         persistence_fenced requires a successful final poll and sync-store wait
         with no intervening store submission (avoids duplicate batch fences).
         Passive TP workers and requests without RemoteFill remain unchanged.
+        If this request reused cached KV and emitted no new store receipt,
+        tokens allows recovery from actual persistent objects (or CPU-only
+        copies that must first be persisted). A cache hit count is not proof
+        of remote persistence. Normal completed stores never take this path.
 
         Raises:
             RuntimeError: Either KV group's persisted frontier is incomplete.
@@ -1761,6 +1766,13 @@ class AscendLMCacheEngine(LMCacheEngine):
         if state.remote_fill is None or state.remote_fill.handoff is None:
             return
         persistent_end = min(state.committed_end.get(group, 0) for group in (0, 1))
+        if persistent_end < required_store_end and tokens is not None:
+            self._recover_layerwise_prefill_persistence(
+                req_id, tokens, request_configs, state, required_store_end
+            )
+            persistent_end = min(
+                state.committed_end.get(group, 0) for group in (0, 1)
+            )
         if persistent_end < required_store_end:
             raise RuntimeError(
                 "Layerwise prefill persistence is incomplete; refusing "
@@ -1772,6 +1784,124 @@ class AscendLMCacheEngine(LMCacheEngine):
                 state.remote_fill.disabled_reason or "layerwise_prefill_persistent_only"
             )
         self._finish_remote_fill(req_id, state, required_store_end)
+
+    def _recover_layerwise_prefill_persistence(
+        self,
+        req_id: str,
+        tokens: list[int],
+        request_configs: Optional[dict],
+        state: _DirectStoreRequestState,
+        required_end: int,
+    ) -> None:
+        """Recover missing request receipts once at final PD handoff.
+
+        Query remote objects, not the LocalCPU-first lookup. Probe whole pages
+        in batches, then legacy layer objects only for page misses. Republish
+        genuinely missing objects from CPU, never from reused NPU banks.
+        """
+        assert self.storage_manager is not None
+        remote = self.storage_manager.storage_backends.get(REMOTE_BACKEND_NAME)
+        if remote is None:
+            raise RuntimeError("Layerwise prefill handoff requires RemoteBackend")
+        page_format = mooncake_layer_pages_enabled(self.config)
+        for group in (0, 1):
+            committed = state.committed_end.get(group, 0)
+            if committed >= required_end:
+                continue
+            plan = [
+                (start, end, key)
+                for start, end, key in self.token_database.process_tokens(
+                    tokens=tokens[:required_end],
+                    request_configs=request_configs,
+                    kv_group=group,
+                )
+                if end > committed
+            ]
+            if not plan or plan[0][0] > committed or plan[-1][1] != required_end:
+                raise RuntimeError(
+                    "Cannot recover complete layerwise prefill persistence: "
+                    f"req_id={req_id}, kv_group={group}, required={required_end}"
+                )
+            keys = [key for _, _, key in plan]
+            queue = self._layerwise_put_queue
+            if queue is not None:
+                # A full cache hit can bypass the store generator that normally
+                # inherits outstanding puts from the original prefix producer.
+                queue.track_keys(req_id, keys)
+                queue.drain_requests((req_id,))
+            page_hits = (
+                self.storage_manager.batched_external_pages_exist(keys)
+                if page_format else [False] * len(keys)
+            )
+            missing = [key for key, hit in zip(keys, page_hits, strict=True) if not hit]
+            if missing:
+                num_layers = self._num_layers_for_kv_group(group)
+                layers = [key.split_layers(num_layers) for key in missing]
+                flat_keys = [key for chunk in layers for key in chunk]
+                # batched_contains returns a contiguous prefix. Only complete
+                # chunks count; a partial legacy chunk must be republished.
+                legacy_chunks = remote.batched_contains(flat_keys) // num_layers
+                for index in range(legacy_chunks, len(missing)):
+                    key, layer_keys = missing[index], layers[index]
+                    # After the first hole, later chunks may still exist even
+                    # if their local CPU copy has already been evicted. Probe
+                    # these chunks once, not the entire remaining suffix.
+                    if (
+                        index > legacy_chunks
+                        and remote.batched_contains(layer_keys) == num_layers
+                    ):
+                        continue
+                    self._republish_layerwise_cpu_chunk(req_id, key, layer_keys)
+                self.wait_for_pending_sync_stores()
+            # Publish only after both remote probes and any repair futures
+            # have succeeded. Never infer success from skip_leading_tokens.
+            state.committed_end[group] = required_end
+            state.submitted_end[group] = max(
+                state.submitted_end.get(group, 0), required_end
+            )
+
+    def _republish_layerwise_cpu_chunk(
+        self,
+        req_id: str,
+        key: CacheEngineKey,
+        layer_keys: list[CacheEngineKey],
+    ) -> None:
+        """Persist an already CPU-ready chunk, retaining sources through put."""
+        assert self.storage_manager is not None
+        local = self._shared_local_cpu_backend()
+        pages, _ = local.batched_get_layer_page_prefix([key])
+        if pages:
+            try:
+                futures = self.storage_manager.batched_put_layer_pages(
+                    [key], pages, req_id=req_id, publish_local_early=True
+                )
+            except BaseException:
+                # The storage manager consumes our get references only on
+                # successful submission; native-unknown DMA retains its own.
+                for page in pages:
+                    page.ref_count_down()
+                raise
+        else:
+            owned = []
+            try:
+                for layer_key in layer_keys:
+                    obj = local.get_blocking(layer_key)
+                    if obj is None:
+                        raise RuntimeError(
+                            "Layerwise prefill KV is absent from both remote "
+                            "storage and LocalCPU: "
+                            f"req_id={req_id}, key={layer_key}"
+                        )
+                    owned.append(obj)
+                remote = self.storage_manager.storage_backends[REMOTE_BACKEND_NAME]
+                futures = remote.batched_submit_put_task(layer_keys, owned)
+            finally:
+                # RemoteBackend owns independent references after submission.
+                for obj in owned:
+                    obj.ref_count_down()
+        if not futures:
+            raise RuntimeError("Missing completion receipt for CPU prefix repair")
+        self._track_sync_store_futures(futures, require_completion=True)
 
     def _track_direct_batch(
         self,

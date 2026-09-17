@@ -217,7 +217,14 @@ def test_step_finalization_fences_persistence_before_handoff(monkeypatch, final)
     if final:
         expected.extend(["latent", "index"])
         expected.append(
-            (("r", {}), {"required_store_end": 5, "persistence_fenced": True})
+            (
+                ("r", {}),
+                {
+                    "required_store_end": 5,
+                    "persistence_fenced": True,
+                    "tokens": request.token_ids,
+                },
+            )
         )
     assert calls == expected
     assert obj._completed_layerwise_stores == {}
@@ -344,6 +351,9 @@ def engine(monkeypatch, *, p_node=True, direct=True, remote=True, rank=0):
             "__init__",
             "adopt_completed_layerwise_store",
             "finish_layerwise_prefill_store",
+            "_recover_layerwise_prefill_persistence",
+            "_republish_layerwise_cpu_chunk",
+            "_track_sync_store_futures",
             "_remote_fill_prepare_request",
             "_finish_remote_fill",
             "wait_for_pending_sync_stores",
@@ -363,6 +373,7 @@ def engine(monkeypatch, *, p_node=True, direct=True, remote=True, rank=0):
             _DirectStoreRequestState=DirectState,
             ProducerRequestState=ProducerState,
             REMOTE_FILL_REQUEST_CONFIG_KEY="lmcache.remote_fill",
+            REMOTE_BACKEND_NAME="RemoteBackend",
             Mapping=dict,
             wait=wait,
         ),
@@ -510,7 +521,9 @@ def test_no_handoff_for_passive_or_ordinary_requests(
     configs,
 ):
     obj = engine(monkeypatch, remote=remote, rank=rank)
-    obj.finish_layerwise_prefill_store("r", configs, required_store_end=511)
+    obj.finish_layerwise_prefill_store(
+        "r", configs, required_store_end=511, tokens=list(range(511))
+    )
     assert obj.drain_remote_fill_terminal_results() == {}
 
 

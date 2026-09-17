@@ -1204,6 +1204,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 request.request_configs,
                 required_store_end=len(request.token_ids),
                 persistence_fenced=True,
+                tokens=request.token_ids,
             )
 
     def _finish_save_batch(self, _save_context: dict[str, Any]) -> None:
