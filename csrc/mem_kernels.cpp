@@ -1137,6 +1137,104 @@ void dense_mla_dsa_batched_direct_kv_transfer_prepared(
   cmd.Run();
 }
 
+void kvcache_ops::launch_prefill_store(const PrefillLoadArgs &a,
+                                      uint32_t cores, void *stream) {
+  single_layer_kv_transfer_kernel_v2_mla_dsa_dense_multi_chunk(
+      a.type, a.slotType, a.format, cores, stream, a.chunkPtrs,
+      a.chunkOffsets, a.chunkSizes, a.key, a.value, a.index, a.slots,
+      a.keyBytes, a.valueBytes, a.indexBytes, a.maxTokensPerLoop,
+      a.kDims, a.vDims, a.indexDims, a.numTokens, a.numChunks,
+      a.fixedChunkSize, a.totalTokens, a.blockSize, true, a.interleaved);
+}
+
+void prefill_store_prepared(
+    const std::shared_ptr<PrefillLoadQueue> &queue,
+    const SparseDirectLayerState &state,
+    torch::Tensor &slots, torch::Tensor &ptrs,
+    torch::Tensor &offsets, torch::Tensor &sizes,
+    int64_t total_tokens, bool interleaved, bool direction,
+    bool validate_inputs, int64_t fixed_chunk_size) {
+  if (validate_inputs) {
+    validate_dense_direct_inputs(slots, ptrs, offsets, sizes,
+                                 total_tokens, fixed_chunk_size);
+    TORCH_CHECK(direction && slots.device().index() == queue->device_index(),
+                "Prefill store queue requires D2H on the same NPU");
+  }
+  const c10::OptionalDeviceGuard guard(device_of(slots));
+  const int32_t num_tokens = static_cast<int32_t>(slots.size(0));
+  if (num_tokens == 0) {
+    return;
+  }
+  const auto &c = state.config;
+  const kvcache_ops::PrefillLoadArgs args{
+      c.ub_params.scalar_type_num, c.ub_params.slot_type_num,
+      kernel_format(c.kvcache_format),
+      get_kernel_ptr<uint8_t, torch::Tensor>(ptrs),
+      get_kernel_ptr<uint8_t, torch::Tensor>(offsets),
+      get_kernel_ptr<uint8_t, torch::Tensor>(sizes),
+      c.ptrs.vllm_k_ptr, c.ptrs.vllm_v_ptr, c.ptrs.vllm_dsa_ptr,
+      get_kernel_ptr<uint8_t, torch::Tensor>(slots),
+      c.strides.vllm_k_bytes, c.strides.vllm_v_bytes, c.strides.vllm_dsa_bytes,
+      c.k_hidden_dims, c.v_hidden_dims, c.dsa_hidden_dims,
+      c.ub_params.max_tokens_per_loop, num_tokens,
+      static_cast<int32_t>(ptrs.numel()), static_cast<int32_t>(fixed_chunk_size),
+      static_cast<int32_t>(total_tokens), c.dims.block_size, interleaved, true};
+  const uint32_t cores = direct_aiv_num(num_tokens);
+  const aclrtStream producer = c10_npu::getCurrentNPUStream().stream();
+  at_npu::native::OpCommand cmd;
+  cmd.Name("prefill_fifo_store");
+  cmd.SetCustomHandler([queue, args, cores, producer]() -> int {
+    queue->submit(args, cores, producer);
+    return 0;
+  });
+  cmd.Run();
+}
+
+void prefill_split_load_prepared(
+    const std::shared_ptr<PrefillLoadQueue> &queue,
+    const SparseDirectDestinationState &state,
+    torch::Tensor &slot_mapping_full, torch::Tensor &chunk_ptrs_npu,
+    torch::Tensor &chunk_offsets_npu, torch::Tensor &chunk_sizes_npu,
+    int64_t total_tokens, bool lmc_host_interleaved,
+    bool validate_inputs, int64_t fixed_chunk_size) {
+  if (validate_inputs) {
+    validate_dense_direct_inputs(slot_mapping_full, chunk_ptrs_npu,
+                                 chunk_offsets_npu, chunk_sizes_npu,
+                                 total_tokens, fixed_chunk_size);
+    TORCH_CHECK(slot_mapping_full.device().index() == queue->device_index(),
+                "Prefill load queue and destination must use the same NPU");
+  }
+  const c10::OptionalDeviceGuard guard(device_of(slot_mapping_full));
+  const int32_t num_tokens = static_cast<int32_t>(slot_mapping_full.size(0));
+  if (num_tokens == 0) {
+    return;
+  }
+  const kvcache_ops::PrefillLoadArgs args{
+      state.scalar_type_num, state.slot_type_num, kernel_format(state.kvcache_format),
+      get_kernel_ptr<uint8_t, torch::Tensor>(chunk_ptrs_npu),
+      get_kernel_ptr<uint8_t, torch::Tensor>(chunk_offsets_npu),
+      get_kernel_ptr<uint8_t, torch::Tensor>(chunk_sizes_npu),
+      state.vllm_k_ptr, state.vllm_v_ptr, state.vllm_dsa_ptr,
+      get_kernel_ptr<uint8_t, torch::Tensor>(slot_mapping_full),
+      state.vllm_k_bytes, state.vllm_v_bytes, state.vllm_dsa_bytes,
+      state.k_hidden_dims, state.v_hidden_dims, state.dsa_hidden_dims,
+      state.max_tokens_per_loop, num_tokens,
+      static_cast<int32_t>(chunk_ptrs_npu.numel()),
+      static_cast<int32_t>(fixed_chunk_size), static_cast<int32_t>(total_tokens),
+      state.block_size, lmc_host_interleaved};
+  const uint32_t cores = direct_aiv_num(num_tokens);
+  const aclrtStream producer = c10_npu::getCurrentNPUStream().stream();
+  at_npu::native::OpCommand cmd;
+  cmd.Name("prefill_split_load");
+  // Execute the entire record -> submit -> join sequence inside ONE queued
+  // command, after earlier torch metadata copies/waits have been dispatched.
+  cmd.SetCustomHandler([queue, args, cores, producer]() -> int {
+    queue->submit(args, cores, producer);
+    return 0;
+  });
+  cmd.Run();
+}
+
 void dense_mla_dsa_group_direct_kv_transfer_fast(
     const std::vector<SparseDirectLayerState> &layer_states,
     torch::Tensor &slot_mapping_full, torch::Tensor &layer_chunk_ptrs_npu,

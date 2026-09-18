@@ -379,6 +379,23 @@ PYBIND11_MODULE(c_ops, m) {
         py::arg("chunk_sizes_npu"), py::arg("total_tokens"),
         py::arg("lmc_host_interleaved"), py::arg("direction"),
         py::arg("validate_inputs") = false, py::arg("fixed_chunk_size") = 0);
+  py::class_<PrefillLoadQueue, std::shared_ptr<PrefillLoadQueue>>(
+      m, "PrefillLoadQueue")
+      .def(py::init<>())
+      .def_property_readonly("priority", &PrefillLoadQueue::priority)
+      .def_property_readonly("priority_verified", &PrefillLoadQueue::priority_verified)
+      .def("store_prepared", &prefill_store_prepared,
+           py::arg("state"), py::arg("slot_mapping_full"),
+           py::arg("chunk_ptrs_npu"), py::arg("chunk_offsets_npu"),
+           py::arg("chunk_sizes_npu"), py::arg("total_tokens"),
+           py::arg("lmc_host_interleaved"), py::arg("direction"),
+           py::arg("validate_inputs") = false, py::arg("fixed_chunk_size") = 0)
+      .def("transfer_prepared", &prefill_split_load_prepared,
+           py::arg("destination_state"), py::arg("slot_mapping_full"),
+           py::arg("chunk_ptrs_npu"), py::arg("chunk_offsets_npu"),
+           py::arg("chunk_sizes_npu"), py::arg("total_tokens"),
+           py::arg("lmc_host_interleaved"), py::arg("validate_inputs") = false,
+           py::arg("fixed_chunk_size") = 0);
   m.def("dense_mla_dsa_batched_direct_kv_transfer_prepared",
         &dense_mla_dsa_batched_direct_kv_transfer_prepared,
         py::arg("destination_state"), py::arg("slot_mapping_full"),

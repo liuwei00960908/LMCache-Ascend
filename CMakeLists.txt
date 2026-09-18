@@ -71,6 +71,7 @@ if(DEFINED ENV{USE_MINDSPORE})
   )
 
 else()
+  add_subdirectory(csrc/prefill_load)
   add_subdirectory(csrc)
   set(TORCH_LIBS_DIR "${TORCH_PATH}/lib")
 
@@ -94,6 +95,8 @@ else()
     ${TORCH_LIBRARIES}
     libtorch_npu.so
     cache_kernels
+    prefill_load_kernels
+    ${CMAKE_DL_LIBS}
     ascendcl
     platform
     ascend_hal

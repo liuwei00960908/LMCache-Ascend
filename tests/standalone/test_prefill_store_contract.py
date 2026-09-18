@@ -77,8 +77,13 @@ def test_deferred_store_priming_passes_its_own_kv_group(kv_group, layers):
     )
 
 
-@pytest.mark.parametrize("kv_group", [0, 1, None])
-def test_real_deferred_store_generator_with_cpu_streams(monkeypatch, kv_group):
+@pytest.mark.parametrize(
+    "kv_group,fifo_enabled",
+    [(0, False), (1, False), (None, False), (0, True), (1, True)],
+)
+def test_real_deferred_store_generator_with_cpu_streams(
+    monkeypatch, kv_group, fifo_enabled
+):
     """Run the repository's complete bank-rotation test without NPU imports.
 
     Only native transfer preparation/kernels and streams are mocked by the
@@ -95,6 +100,7 @@ def test_real_deferred_store_generator_with_cpu_streams(monkeypatch, kv_group):
     )
     actual = {
         "batched_from_gpu",
+        "_get_prefill_transfer_queue",
         "_prepare_dense_direct_chunk_metadata",
         "_dense_direct_dummy_metadata_tensor",
         "_run_dense_direct_kv_transfer_layer",
@@ -204,7 +210,7 @@ def test_real_deferred_store_generator_with_cpu_streams(monkeypatch, kv_group):
         lambda tensor, stream: recorded.append((tensor, stream)),
     )
     if kv_group is not None:
-        namespace[test_name](monkeypatch, kv_group)
+        namespace[test_name](monkeypatch, kv_group, fifo_enabled)
         assert recorded, "native transfer pointers must retain their input tensors"
     else:
         namespace[test_name](monkeypatch)
