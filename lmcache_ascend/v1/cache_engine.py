@@ -81,6 +81,7 @@ from lmcache.v1.token_database import (
     DSA_INDEX_CACHE_SCHEMA_TAG,
     TokenDatabase,
 )
+from lmcache.v1.startup_trace import startup_phase
 import torch
 
 # First Party
@@ -583,10 +584,13 @@ class AscendLMCacheEngine(LMCacheEngine):
                         "group1_external_reader_init_start",
                         rank=self.metadata.worker_id,
                     )
-                self._group1_external_page_reader = RemoteExternalPageReader(
-                    self.config,
-                    self.metadata,
-                )
+                with startup_phase(
+                    "group1_external_reader", rank=self.metadata.worker_id
+                ):
+                    self._group1_external_page_reader = RemoteExternalPageReader(
+                        self.config,
+                        self.metadata,
+                    )
                 if perf_enabled:
                     serving_perf_log(
                         logger,
@@ -601,7 +605,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                     "remote_fill_decoder_init_start",
                     rank=self.metadata.worker_id,
                 )
-            self._initialize_decoder_remote_fill()
+            with startup_phase("decoder_remote_fill", rank=self.metadata.worker_id):
+                self._initialize_decoder_remote_fill()
             if perf_enabled:
                 serving_perf_log(
                     logger,
