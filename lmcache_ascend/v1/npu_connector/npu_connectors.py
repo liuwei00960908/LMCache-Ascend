@@ -6712,7 +6712,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         deferred_layerwise_put = bool(kwargs.get("deferred_layerwise_put", False))
         slot_mappings = {} if deferred_layerwise_put else None
-        _, slot_mapping_full, _ = _cached_layerwise_slot_mapping(
+        slot_mapping_chunks, slot_mapping_full, _ = _cached_layerwise_slot_mapping(
             slot_mappings,
             slot_mapping,
             starts,
@@ -6983,22 +6983,27 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 current_stream = torch.npu.current_stream()
                 bank = layer_id % source_bank_count
 
-                layer_slot_mapping, layer_slot_mapping_base = (
-                    _resolve_layerwise_slot_mapping(
-                        layer_request,
-                        slot_mapping,
-                        slot_mapping_base,
+                if layer_request is None:
+                    # Ordinary stores keep one mapping for every layer. Reuse
+                    # its prepared device tensor, including CPU-to-NPU copies.
+                    layer_slot_mapping_chunks = slot_mapping_chunks
+                    layer_slot_mapping_full = slot_mapping_full
+                    new_mapping = False
+                else:
+                    # Only explicit P-node bank switches need another mapping.
+                    layer_slot_mapping, layer_slot_mapping_base = (
+                        _resolve_layerwise_slot_mapping(
+                            layer_request, slot_mapping, slot_mapping_base
+                        )
                     )
-                )
-                layer_slot_mapping_chunks, layer_slot_mapping_full, new_mapping = (
-                    _cached_layerwise_slot_mapping(
-                        slot_mappings,
-                        layer_slot_mapping,
-                        starts,
-                        ends,
+                    (
+                        layer_slot_mapping_chunks,
+                        layer_slot_mapping_full,
+                        new_mapping,
+                    ) = _cached_layerwise_slot_mapping(
+                        slot_mappings, layer_slot_mapping, starts, ends,
                         layer_slot_mapping_base,
                     )
-                )
                 if new_mapping and len(layer_slot_mapping_full) != num_tokens:
                     raise RuntimeError(
                         "Layerwise store changed transfer token count: "
