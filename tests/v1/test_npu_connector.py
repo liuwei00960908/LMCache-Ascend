@@ -5049,8 +5049,12 @@ def test_deferred_batched_from_gpu_rotates_two_banks_and_reports_completion(
     assert state_calls == [(0, False), (1, False), (2, False), (3, False)]
     assert generator.send({"slot_mapping": torch.tensor([10])}) is None
     assert generator.send({"slot_mapping": torch.tensor([20])}) is None
-    assert generator.send({"slot_mapping": torch.tensor([30])}) == 0
-    assert generator.send({"slot_mapping": torch.tensor([40])}) == 1
+    assert generator.send({"slot_mapping": torch.tensor([30])}) is None
+    assert generator.send({"slot_mapping": torch.tensor([40])}) is None
+    assert all(event.records == ["store"] for event in events[:4])
+    assert "synchronize" not in connector.store_stream.events
+    assert next(generator) == 0
+    assert next(generator) == 1
     assert next(generator) == 2
     assert next(generator) == 3
     with pytest.raises(StopIteration):
@@ -5064,9 +5068,9 @@ def test_deferred_batched_from_gpu_rotates_two_banks_and_reports_completion(
     ]
     assert state_calls == [(0, False), (1, False), (2, False), (3, False)]
     assert compute_stream.events == []
-    assert events[0].records == ["store", "synchronize"]
-    assert events[1].records == ["store", "synchronize"]
-    assert events[2].records == ["store", "synchronize"]
+    assert events[0].records == ["store"]
+    assert events[1].records == ["store"]
+    assert events[2].records == ["store"]
     assert events[3].records == ["store", "synchronize"]
     assert "synchronize" not in connector.store_stream.events
     assert connector._layerwise_prefill_bank_counts == {kv_group: 2}
@@ -5096,6 +5100,7 @@ def test_deferred_batched_from_gpu_rotates_two_banks_and_reports_completion(
 
 def test_deferred_staging_store_keeps_single_source_bank(monkeypatch) -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.dsa_two_groups = False
     connector.num_layers = 2
     connector.kvcaches = [object(), object()]
     connector.use_gpu = False
@@ -5154,7 +5159,9 @@ def test_deferred_staging_store_keeps_single_source_bank(monkeypatch) -> None:
 
     assert next(generator) is None
     assert generator.send({"slot_mapping": torch.tensor([10])}) is None
-    assert generator.send({"slot_mapping": torch.tensor([20])}) == 0
+    assert generator.send({"slot_mapping": torch.tensor([20])}) is None
+    assert all(event.records == ["store"] for event in events)
+    assert next(generator) == 0
     assert next(generator) == 1
     with pytest.raises(StopIteration):
         next(generator)
@@ -5163,7 +5170,7 @@ def test_deferred_staging_store_keeps_single_source_bank(monkeypatch) -> None:
         ("wait_event", "layer-0"),
         ("wait_event", "layer-1"),
     ]
-    assert events[0].records == ["store", "synchronize"]
+    assert events[0].records == ["store"]
     assert events[1].records == ["store", "synchronize"]
 
 

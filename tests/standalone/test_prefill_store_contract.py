@@ -77,7 +77,7 @@ def test_deferred_store_priming_passes_its_own_kv_group(kv_group, layers):
     )
 
 
-@pytest.mark.parametrize("kv_group", [0, 1])
+@pytest.mark.parametrize("kv_group", [0, 1, None])
 def test_real_deferred_store_generator_with_cpu_streams(monkeypatch, kv_group):
     """Run the repository's complete bank-rotation test without NPU imports.
 
@@ -153,6 +153,7 @@ def test_real_deferred_store_generator_with_cpu_streams(monkeypatch, kv_group):
         _mtp_dw_deep_diag_enabled=lambda: False,
         dense_mla_dsa_batched_direct_kv_transfer_fast=lambda *args, **kwargs: None,
         dense_mla_dsa_batched_direct_kv_transfer=lambda *args, **kwargs: None,
+        lmc_ops=SimpleNamespace(single_layer_kv_transfer=lambda *args: None),
     )
     unit = ast.Module(
         body=[
@@ -169,6 +170,8 @@ def test_real_deferred_store_generator_with_cpu_streams(monkeypatch, kv_group):
     test_tree = ast.parse(tests_path.read_text(encoding="utf-8"))
     test_name = (
         "test_deferred_batched_from_gpu_rotates_two_banks_and_reports_completion"
+        if kv_group is not None
+        else "test_deferred_staging_store_keeps_single_source_bank"
     )
     definitions = [
         n
@@ -188,6 +191,7 @@ def test_real_deferred_store_generator_with_cpu_streams(monkeypatch, kv_group):
         nullcontext=nullcontext,
         SimpleNamespace=SimpleNamespace,
         npu_connectors=module,
+        lmc_ops=module.lmc_ops,
         MemoryFormat=SimpleNamespace(KV_MLA_LATENT_FMT="latent"),
         VLLMPagedMemLayerwiseNPUConnector=module.VLLMPagedMemLayerwiseNPUConnector,
     )
@@ -199,5 +203,8 @@ def test_real_deferred_store_generator_with_cpu_streams(monkeypatch, kv_group):
         "record_stream",
         lambda tensor, stream: recorded.append((tensor, stream)),
     )
-    namespace[test_name](monkeypatch, kv_group)
-    assert recorded, "native transfer pointers must retain their input tensors"
+    if kv_group is not None:
+        namespace[test_name](monkeypatch, kv_group)
+        assert recorded, "native transfer pointers must retain their input tensors"
+    else:
+        namespace[test_name](monkeypatch)

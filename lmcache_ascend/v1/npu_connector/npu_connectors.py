@@ -6960,12 +6960,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         )
                     deferred_dense_layer_states.append(layer_state)
                     deferred_dense_validation_keys.append(validation_key)
-            bank_done_events: list[Optional[Any]] = [
-                None
-            ] * source_bank_count
-            pending_layer_by_bank: list[Optional[int]] = [
-                None
-            ] * source_bank_count
+            last_store_event = None
             layer_request = None
             if deferred_layerwise_put:
                 layer_request = yield None
@@ -6980,20 +6975,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 # or runtime stream changes do not attach dependencies to a
                 # stale stream from the first layer.
                 current_stream = torch.npu.current_stream()
-                completed_layer = None
                 bank = layer_id % source_bank_count
-                if deferred_layerwise_put:
-                    completed_layer = pending_layer_by_bank[bank]
-                if completed_layer is not None:
-                    # The compute stream was fenced before this bank's reuse.
-                    # Synchronize only that bank's old D2H event so its CPU
-                    # objects can be published without draining newer stores.
-                    completed_event = bank_done_events[bank]
-                    assert completed_event is not None
-                    completed_event.synchronize()
-                    pending_layer_by_bank[bank] = None
-                    bank_done_events[bank] = None
-                    log_completed_store_layer(completed_layer)
 
                 layer_slot_mapping, layer_slot_mapping_base = (
                     _resolve_layerwise_slot_mapping(
@@ -7141,8 +7123,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 if deferred_layerwise_put:
                     bank_done_event = torch.npu.Event()
                     bank_done_event.record(self.store_stream)
-                    bank_done_events[bank] = bank_done_event
-                    pending_layer_by_bank[bank] = layer_id
+                    last_store_event = bank_done_event
                     if dense_direct:
                         _, _, save_done, _ = (
                             self._layerwise_prefill_transfer_state()
@@ -7161,7 +7142,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         # Preserve its legacy fence before the next layer.
                         current_stream.wait_event(bank_done_event)
                 if deferred_layerwise_put:
-                    layer_request = yield completed_layer
+                    # Bank reuse is already fenced on the device. Do not
+                    # block Python here to publish an older CPU destination:
+                    # that delays submission of this layer's TP collective.
+                    # All destination objects remain owned by memory_objs.
+                    layer_request = yield None
                 else:
                     yield
                     # Legacy store_layer publishes the CPU objects immediately
@@ -7171,21 +7156,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     log_completed_store_layer(layer_id)
 
             if deferred_layerwise_put:
-                remaining_layers = sorted(
-                    layer_id
-                    for layer_id in pending_layer_by_bank
-                    if layer_id is not None
-                )
-                for completed_layer in remaining_layers:
-                    bank = completed_layer % source_bank_count
-                    completed_event = bank_done_events[bank]
-                    assert completed_event is not None
-                    completed_event.synchronize()
-                    pending_layer_by_bank[bank] = None
-                    bank_done_events[bank] = None
+                # FIFO store_stream: the last event covers every submitted
+                # layer. Publish only during the existing chunk-end drain,
+                # after CPU contents are ready for local/remote consumers.
+                if last_store_event is not None:
+                    last_store_event.synchronize()
+                store_transfer_pending = False
+                for completed_layer in range(expected_layers):
                     log_completed_store_layer(completed_layer)
                     yield completed_layer
-                store_transfer_pending = False
 
             # free the buffer memory
             if self.use_gpu and tmp_gpu_buffer_obj is not None:
