@@ -38,10 +38,14 @@ layer with its count and maximum absolute difference.
 
 The script prints its result directory, per-case log paths, and final verdict.
 `summary.json` contains all case reports. `setup_copies` / `layer_copies` count
-materialized full mappings; `reused` counts reuse-control hits. On the current
-code, the two-chunk current case makes 1 setup copy and 22 layer copies; the
-reuse control makes 1 setup copy and 0 layer copies. Counters do not retain
-temporary mapping tensors, which would otherwise mask a lifetime race.
+materialized full mappings; `reused` counts reuse-control helper hits. Before
+the fixed-map reuse fix (for example, commit `b44dc48`), the two-chunk current
+case made 1 setup copy and 22 layer copies. With the fix, both multi-chunk cases
+should report `calls=1`, `setup_copies=1`, `layer_copies=0`: production now reuses
+the prepared tensor directly without calling the mapping helper per layer.
+Consequently the control's helper-level `reused` counter is also 0. Counters do
+not retain temporary mapping tensors, which would otherwise mask a lifetime
+race. The single-chunk case uses a view and has no setup or per-layer copy.
 
 - `REPRODUCED_DATA_MISMATCH`: controls passed but the current multi-chunk path
   copied incorrect data. This isolates a mapping-related failure in this test.

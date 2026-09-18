@@ -2,6 +2,7 @@
 """CPU coverage of the NPU repro's controls, using the production mapping helpers."""
 
 import ast
+from contextlib import nullcontext
 import importlib.util
 import json
 from pathlib import Path
@@ -88,8 +89,13 @@ def test_single_chunk_does_not_allocate_full_mapping(mapping_helper):
 
 
 @pytest.mark.parametrize("reuse", [False, True])
+@pytest.mark.parametrize("copy_to_device", [False, True])
+@pytest.mark.parametrize(
+    "ranges", [([0], [1024]), ([0, 1024], [1024, 1116]), ([0, 1100], [1024, 1192])]
+)
+@pytest.mark.parametrize("banked", [False, True])
 def test_actual_deferred_generator_uses_probe_without_changing_protocol(
-    mapping_helper, monkeypatch, reuse
+    mapping_helper, monkeypatch, reuse, copy_to_device, ranges, banked
 ):
     """Drive the production generator on CPU; only its NPU operations are stubbed."""
     path = ROOT / "lmcache_ascend/v1/npu_connector/npu_connectors.py"
@@ -118,7 +124,8 @@ def test_actual_deferred_generator_uses_probe_without_changing_protocol(
             if isinstance(node, ast.FunctionDef) and node.name == "batched_to_gpu"
         )
     )
-    probe = repro.MappingProbe(mapping_helper, reuse)
+    # The fixed-map test control must not override a P-node bank switch.
+    probe = repro.MappingProbe(mapping_helper, reuse and not banked)
     scope = dict(
         torch=torch,
         _cached_layerwise_slot_mapping=probe,
@@ -137,8 +144,18 @@ def test_actual_deferred_generator_uses_probe_without_changing_protocol(
         type_ignores=[],
     )
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), scope)
-    stream = SimpleNamespace(wait_stream=lambda _: None)
+    waits, synchronizations, validated = [], [], []
+    stream = SimpleNamespace(
+        wait_stream=lambda other: waits.append(other),
+        synchronize=lambda: synchronizations.append(True),
+    )
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(Event=lambda: SimpleNamespace(record=lambda _: None)),
+        raising=False,
+    )
     layout = SimpleNamespace(
         kv_format=SimpleNamespace(value=6),
         vllm_two_major=False,
@@ -147,14 +164,29 @@ def test_actual_deferred_generator_uses_probe_without_changing_protocol(
         dsa_hidden_dims=128,
         kv_device=torch.device("cpu"),
     )
-    mapping = torch.arange(1115, -1, -1)
-    submitted = []
+    starts, ends = ranges
+    mapping = torch.arange(max(ends) - 1, -1, -1)
+    bank_mappings = [mapping, mapping + 2048]
+    submitted, prepared_mappings, used_mappings = [], [], []
+
+    def prepare_mapping(slots, _):
+        # Simulate CPU -> NPU conversion returning a distinct tensor owner.
+        prepared = slots.clone() if copy_to_device else slots
+        prepared_mappings.append(prepared)
+        return prepared
 
     def transfer(**kwargs):
         assert kwargs["direction"] is False
         assert kwargs["current_stream"] is stream
         assert kwargs["transfer_stream"] is stream
-        assert torch.equal(kwargs["slot_mapping_full"], mapping)
+        selected = bank_mappings[kwargs["layer_id"] % 2] if banked else mapping
+        expected = torch.cat(
+            [selected[start:end] for start, end in zip(starts, ends, strict=True)]
+        )
+        assert torch.equal(kwargs["slot_mapping_full"], expected)
+        if not banked:
+            assert kwargs["slot_mapping_full"] is prepared_mappings[0]
+        used_mappings.append(kwargs["slot_mapping_full"])
         submitted.append(kwargs["layer_id"])
 
     connector = SimpleNamespace(
@@ -164,7 +196,7 @@ def test_actual_deferred_generator_uses_probe_without_changing_protocol(
         initialize_kvcaches_ptr=lambda **kw: None,
         _lazy_initialize_buffer_with_staging=lambda *a, **kw: layout,
         _is_mla_dsa_format=lambda _: True,
-        _check_layerwise_transfer_invariants=lambda **kw: None,
+        _check_layerwise_transfer_invariants=lambda **kw: validated.append(kw),
         _layerwise_token_major=lambda _: True,
         _expected_memory_format=lambda _: "index",
         _sparse_lmc_host_interleaved=lambda _: True,
@@ -173,7 +205,7 @@ def test_actual_deferred_generator_uses_probe_without_changing_protocol(
             torch.tensor([0, 1024]),
             torch.tensor([1024, 92]),
         ),
-        _slot_mapping_on_kv_device=lambda slots, _: slots,
+        _slot_mapping_on_kv_device=prepare_mapping,
         _get_or_create_sparse_destination_plan=lambda **kw: object(),
         _expected_group_layers=lambda _: 3,
         _resolve_sparse_chunk_ptrs_npu=lambda *a, **kw: torch.zeros(
@@ -181,36 +213,59 @@ def test_actual_deferred_generator_uses_probe_without_changing_protocol(
         ),
         _run_dense_direct_kv_transfer_layer=transfer,
         record_dense_load_readiness=lambda: "ready",
+        _set_layerwise_prefill_bank_count=lambda *a: None,
+        _layerwise_prefill_transfer_generation=lambda _: 1,
+        _check_layerwise_prefill_transfer_generation=lambda *a: None,
+        _layerwise_prefill_bank=lambda layer, group: layer % 2,
+        _layerwise_prefill_transfer_state=lambda: ({}, {}, {}, {}),
+        _stream_context_or_null=lambda _: nullcontext(),
     )
     readiness = []
     generator = scope["batched_to_gpu"](
         connector,
-        [0, 1024],
-        [1024, 1116],
+        starts,
+        ends,
         slot_mapping=mapping,
         sync=True,
         kv_group=1,
         kvcaches=[object()] * 3,
-        _dense_load_readiness_out=readiness,
+        deferred_layerwise_get=banked,
+        **({} if banked else {"_dense_load_readiness_out": readiness}),
         cached_chunk_ptrs_npu=[],
         cached_chunk_dev_ptrs=[],
     )
     next(generator)
-    for _ in range(3):
+    for layer in range(3):
+        objects = [
+            SimpleNamespace(
+                metadata=SimpleNamespace(fmt="index"), tensor=torch.zeros(end - start)
+            )
+            for start, end in zip(starts, ends, strict=True)
+        ]
         generator.send(
-            [
-                SimpleNamespace(
-                    metadata=SimpleNamespace(fmt="index"), tensor=torch.zeros(size)
-                )
-                for size in (1024, 92)
-            ]
+            {
+                "memory_objs": objects,
+                "layer_request": {"slot_mapping": bank_mappings[layer % 2]},
+            }
+            if banked
+            else objects
         )
     for _ in generator:
         pass
     assert submitted == [0, 1, 2]
-    assert readiness == ["ready"]
-    assert probe.calls == 4
-    assert probe.layer_copies == (0 if reuse else 3)
+    if banked:
+        assert readiness == []
+        assert probe.calls == 4
+        assert used_mappings[0] is used_mappings[2]
+        assert used_mappings[0] is not used_mappings[1]
+        assert synchronizations == [True]  # Existing terminal P-side fence only.
+    else:
+        assert readiness == ["ready"]
+        assert probe.calls == 1
+        assert probe.layer_copies == 0
+        assert len(validated) == 1
+        assert waits == [stream]  # Existing setup dependency; no per-layer wait.
+        assert synchronizations == []
 
 
 @pytest.mark.parametrize(
