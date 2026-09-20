@@ -54,7 +54,6 @@ from lmcache_ascend.v1.content_diagnostics import (
 from lmcache_ascend.v1.kv_format import KVCacheFormat
 from lmcache_ascend.v1.npu_connector.layerwise_dma import (
     bind_copy_addresses,
-    plan_bundle_copies,
 )
 from lmcache_ascend.v1.npu_connector.utils import (
     batched_fused_single_layer_kv_transfer,
@@ -253,36 +252,35 @@ def _prefill_dma_plans(
     kv_group: int,
     kvcaches: Sequence,
     direction: str,
+    cycle,
 ) -> tuple:
     """Plan both P-node banks once, before entering the model forward.
 
-    The P-only physical bundle is twice the natural 2/9-page DSA bundle.
-    Only CPU slot maps are inspected here; no device-to-host sync is needed.
+    Cycle tables were built from the registered allocator layout at startup.
+    Only segment boundaries are indexed; no token scan or D2H sync is needed.
     """
     started = time.perf_counter() if prefill_start_timing_enabled() else 0.0
     if len(cpu_slots_by_bank) != 2:
         raise ValueError("Layerwise prefill DMA requires two CPU bank maps")
-    if any(not plane.is_contiguous() for plane in kvcaches[0]):
+    if (cpu_slots_by_bank[0].device.type != "cpu"
+            or cpu_slots_by_bank[1].device.type != "cpu"):
+        raise ValueError("Layerwise prefill DMA needs CPU slot maps")
+    if (not kvcaches[0][0].is_contiguous()
+            or not kvcaches[0][-1].is_contiguous()):
         raise ValueError("Layerwise prefill DMA requires contiguous NPU planes")
-    block_tokens = int(kvcaches[0][0].shape[1])
-    bundle_tokens = block_tokens * (4 if kv_group == 0 else 18)
-    slot_capacity = int(kvcaches[0][0].shape[0]) * block_tokens
-    plans = []
-    for slots in cpu_slots_by_bank:
-        if slots.device.type != "cpu":
-            raise ValueError("Layerwise prefill DMA needs CPU slot maps")
-        _, selected = _slice_layerwise_slot_mapping(
-            slots, starts, ends, slot_mapping_base, allow_view=True
-        )
-        plan = plan_bundle_copies(selected.tolist(), chunk_sizes, bundle_tokens)
-        if plan and max(s.slot + s.tokens for s in plan) > slot_capacity:
-            raise ValueError("Layerwise prefill DMA slot map exceeds NPU bank")
-        plans.append(plan)
+    plans = (
+        cycle.plan_ranges(cpu_slots_by_bank[0], starts, ends, slot_mapping_base),
+        cycle.plan_ranges(cpu_slots_by_bank[1], starts, ends, slot_mapping_base),
+    )
+    capacity = int(kvcaches[0][0].shape[0]) * int(kvcaches[0][0].shape[1])
+    if (bool((plans[0].slot + plans[0].tokens > capacity).any())
+            or bool((plans[1].slot + plans[1].tokens > capacity).any())):
+        raise ValueError("Layerwise prefill DMA slot map exceeds NPU bank")
     if started:
         prefill_start_timing_log(
             logger, "dma_plan", started, direction=direction,
             kv_group=kv_group, tokens=sum(chunk_sizes),
-            segments_by_bank=[len(plan) for plan in plans],
+            segments_by_bank=[len(plans[0]), len(plans[1])],
         )
     return tuple(plans)
 
@@ -5605,6 +5603,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             dma_plans = _prefill_dma_plans(
                 kwargs["prefill_dma_cpu_slots_by_bank"], starts, ends, 0,
                 chunk_sizes, kv_group, kvcaches_snapshot, "load",
+                self.prefill_dma_cycles[kv_group],
             )
         if dense_direct and not prefill_dma:
             (
@@ -6937,6 +6936,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             dma_plans = _prefill_dma_plans(
                 kwargs["prefill_dma_cpu_slots_by_bank"], starts, ends,
                 0, chunk_sizes, kv_group, kvcaches_snapshot, "store",
+                self.prefill_dma_cycles[kv_group],
             )
         if dense_direct and not prefill_dma:
             (
