@@ -151,6 +151,7 @@ def test_real_deferred_store_generator_with_cpu_streams(monkeypatch, kv_group):
         LayerPageMemoryObj=type("LayerPageMemoryObj", (), {}),
         _DENSE_DIRECT_STORE_DISABLE=False,
         _mtp_dw_deep_diag_enabled=lambda: False,
+        prefill_start_timing_enabled=lambda: False,
         dense_mla_dsa_batched_direct_kv_transfer_fast=lambda *args, **kwargs: None,
         dense_mla_dsa_batched_direct_kv_transfer=lambda *args, **kwargs: None,
         lmc_ops=SimpleNamespace(single_layer_kv_transfer=lambda *args: None),

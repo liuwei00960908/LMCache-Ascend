@@ -2117,6 +2117,24 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         bank_count = bank_counts.get(kv_group, 2)
         return int(layer_id) % bank_count
 
+    def _flush_prefill_first_bank_timing_events(self) -> None:
+        """Read completed diagnostic events without introducing a new fence."""
+        pending = getattr(self, "_prefill_first_bank_timing_events", None)
+        if not pending:
+            return
+        remaining = []
+        for start_event, end_event, fields in pending:
+            if not end_event.query():
+                remaining.append((start_event, end_event, fields))
+                continue
+            device_ms = round(start_event.elapsed_time(end_event), 3)
+            prefill_start_timing_log(
+                logger, "first_bank_wait_device", time.perf_counter(),
+                elapsed_ms=device_ms, device_wait_ms=device_ms,
+                scope="device_event", **fields,
+            )
+        self._prefill_first_bank_timing_events = remaining
+
     def wait_for_layerwise_prefill_load(
         self,
         layer_id: int,
@@ -2150,20 +2168,20 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             current_stream.wait_event(load_record[1])
         if diagnose_first_bank:
             device_wait_end.record(current_stream)
-            # Diagnostic mode only: this is the first consumer's required
-            # dependency. Synchronize its event to distinguish a device-side
-            # H2D wait from CPU setup hidden under mla_forward in the trace.
-            device_wait_end.synchronize()
-            prefill_start_timing_log(
-                logger, "first_bank_wait", wait_started,
+            fields = dict(
                 kv_group=kv_group, layer_id=layer_id, bank=bank,
                 save_event=save_record is not None
                 and save_record[0] == generation,
                 load_event=load_record is not None
                 and load_record[0] == generation,
-                device_wait_ms=round(
-                    device_wait_start.elapsed_time(device_wait_end), 3
-                ),
+            )
+            pending = getattr(self, "_prefill_first_bank_timing_events", None)
+            if pending is None:
+                pending = []
+                self._prefill_first_bank_timing_events = pending
+            pending.append((device_wait_start, device_wait_end, fields))
+            prefill_start_timing_log(
+                logger, "first_bank_wait_enqueue", wait_started, **fields,
             )
 
     @contextmanager
@@ -5891,7 +5909,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             # (rather than when N-1 submits the final load) preserves the
             # load(N) / HCOM(N-1) overlap while preventing source-buffer UAF.
             if deferred_dense_direct_get and deferred_load_submitted:
+                final_load_sync_started = (
+                    time.perf_counter() if prefill_start_timing_enabled() else 0.0
+                )
                 self.load_stream.synchronize()
+                if final_load_sync_started:
+                    prefill_start_timing_log(
+                        logger, "final_load_source_sync", final_load_sync_started,
+                        kv_group=kv_group, tokens=num_tokens,
+                    )
             elif sync and not defer_dense_waits:
                 current_stream.wait_stream(self.load_stream)
             if tmp_gpu_buffer_obj is not None:
@@ -7367,7 +7393,18 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 # layer. Publish only during the existing chunk-end drain,
                 # after CPU contents are ready for local/remote consumers.
                 if last_store_event is not None:
+                    store_publish_sync_started = (
+                        time.perf_counter()
+                        if prefill_start_timing_enabled() else 0.0
+                    )
                     last_store_event.synchronize()
+                    if store_publish_sync_started:
+                        prefill_start_timing_log(
+                            logger, "store_publish_sync", store_publish_sync_started,
+                            kv_group=kv_group, tokens=num_tokens,
+                            layers=expected_layers,
+                        )
+                        self._flush_prefill_first_bank_timing_events()
                 store_transfer_pending = False
                 for completed_layer in range(expected_layers):
                     log_completed_store_layer(completed_layer)
