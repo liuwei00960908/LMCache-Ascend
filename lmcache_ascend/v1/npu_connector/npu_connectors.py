@@ -1823,12 +1823,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self.enable_npu_transfer_validation = bool(
             kwargs.get("enable_npu_transfer_validation", True)
         )
-        # Experimental P-only D2H/H2D FIFO. Read once, not per layer.
-        # 0: unchanged; 1: whole D2H then <=16384-token H2D on low priority.
-        self._prefill_split_load_enabled = (
-            os.getenv("LMCACHE_ASCEND_PREFILL_SPLIT_LOAD", "0") == "1"
-        )
-        self._prefill_split_load_queue = None
         self.max_staging_tokens = int(kwargs.get("max_staging_tokens", 0) or 0)
         # Concurrent layerwise staging buffers per kv_group (retrieve batch +
         # overlapping store). Default 2 covers retrieve+store for one request.
@@ -3864,7 +3858,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         require_prepared_state: bool = False,
         prepared_layer_state: Any = None,
         prepared_validation_key: Optional[tuple] = None,
-        prefill_load_queue: Any = None,
     ) -> None:
         num_tokens = int(slot_mapping_full.numel())
         if num_tokens == 0 or total_tokens <= 0 or chunk_ptrs_npu.numel() == 0:
@@ -3885,12 +3878,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             with self._stream_context_or_null(transfer_stream):
                 if transfer_stream is not current_stream:
                     transfer_stream.wait_stream(current_stream)
-                load_prepared = (
-                    dense_mla_dsa_batched_direct_kv_transfer_prepared
-                    if prefill_load_queue is None
-                    else prefill_load_queue.transfer_prepared
-                )
-                load_prepared(
+                dense_mla_dsa_batched_direct_kv_transfer_prepared(
                     destination_plan.states[layer_id],
                     slot_mapping_full,
                     chunk_ptrs_npu,
@@ -3961,12 +3949,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     getattr(self, "enable_npu_transfer_validation", True)
                     and validate_key not in self._sparse_direct_validated_layers
                 )
-                transfer_prepared = (
-                    prefill_load_queue.store_prepared
-                    if prefill_load_queue is not None and direction
-                    else dense_mla_dsa_batched_direct_kv_transfer_fast
-                )
-                transfer_prepared(
+                dense_mla_dsa_batched_direct_kv_transfer_fast(
                     layer_state,
                     slot_mapping_full,
                     chunk_ptrs_npu,
@@ -4005,21 +3988,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         # compute/communication window free for the transfer.
         if not defer_consumer_wait and transfer_stream is not current_stream:
             current_stream.wait_stream(transfer_stream)
-
-    def _get_prefill_transfer_queue(self, kv_device):
-        if not getattr(self, "_prefill_split_load_enabled", False):
-            return None
-        if self._prefill_split_load_queue is None:
-            with torch.npu.device(kv_device):
-                self._prefill_split_load_queue = lmc_ops.PrefillLoadQueue()
-            logger.info(
-                "[PREFILL_SPLIT_LOAD] tokens_per_kernel=16384 "
-                "fifo=D2H_then_H2D priority=%d priority_readback=%s; "
-                "per-layer consumer fences, no per-fragment host wait",
-                self._prefill_split_load_queue.priority,
-                self._prefill_split_load_queue.priority_verified,
-            )
-        return self._prefill_split_load_queue
 
     def supports_batched_from_gpu_group(self, kv_group: int = 0) -> bool:
         return (
@@ -5556,12 +5524,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             {"stream": self.load_stream} if defer_dense_waits else {}
         )
 
-        # Ordinary/D-side dense loads never construct or use the extra queue.
-        prefill_load_queue = (
-            self._get_prefill_transfer_queue(layout.kv_device)
-            if deferred_dense_direct_get else None
-        )
-
         tmp_gpu_buffer_obj: Optional[MemoryObj] = None
         staging_tensor: Optional[torch.Tensor] = None
         if self.use_gpu and not dense_direct:
@@ -5719,7 +5681,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         direction=False,
                         destination_plan=destination_plan,
                         defer_consumer_wait=deferred_dense_direct_get,
-                        prefill_load_queue=prefill_load_queue,
                     )
                     if deferred_dense_direct_get:
                         load_done_event = torch.npu.Event()
@@ -6750,15 +6711,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             current_offset += chunk_size
 
         deferred_layerwise_put = bool(kwargs.get("deferred_layerwise_put", False))
-        prefill_load_queue = (
-            self._get_prefill_transfer_queue(layout.kv_device)
-            if deferred_layerwise_put and dense_direct else None
-        )
-        # Both directions must share the torch dispatch stream as well as the
-        # native FIFO: otherwise separate task queues could reorder submissions.
-        store_stream = (
-            self.load_stream if prefill_load_queue is not None else self.store_stream
-        )
         slot_mappings = {} if deferred_layerwise_put else None
         slot_mapping_chunks, slot_mapping_full, _ = _cached_layerwise_slot_mapping(
             slot_mappings,
@@ -6919,7 +6871,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 layerwise_prefill_generation = None
 
             # Deferred P-node saves are resumed from the latency-sensitive
-            # transfer callback. Resolve every registered host pointer, upload
+            # pre-HCOM callback.  Resolve every registered host pointer, upload
             # one dense pointer table, and build every native layer state now,
             # before the generator's priming yield.  The per-layer callback may
             # then only select an already prepared row and launch the transfer.
@@ -7014,10 +6966,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         )
                     deferred_dense_layer_states.append(layer_state)
                     deferred_dense_validation_keys.append(validation_key)
-            if store_stream is not self.store_stream:
-                # Metadata preparation retains its original stream. Bridge it
-                # once per chunk/group, before any per-layer submission.
-                store_stream.wait_stream(self.store_stream)
             last_store_event = None
             layer_request = None
             if deferred_layerwise_put:
@@ -7108,7 +7056,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         kvcaches_ref=kvcaches_snapshot,
                         kv_group=kv_group,
                         layer_id=layer_id,
-                        transfer_stream=store_stream,
+                        transfer_stream=self.store_stream,
                         current_stream=current_stream,
                         slot_mapping_full=layer_slot_mapping_full,
                         chunk_ptrs_npu=chunk_ptrs_npu,
@@ -7137,7 +7085,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             if deferred_layerwise_put
                             else None
                         ),
-                        prefill_load_queue=prefill_load_queue,
                     )
                     logger.debug("Finished offloading layer %d", layer_id)
                 else:
@@ -7186,7 +7133,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         logger.debug("Finished offloading layer %d", layer_id)
                 if deferred_layerwise_put:
                     bank_done_event = torch.npu.Event()
-                    bank_done_event.record(store_stream)
+                    bank_done_event.record(self.store_stream)
                     last_store_event = bank_done_event
                     if dense_direct:
                         _, _, save_done, _ = (
@@ -7238,7 +7185,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 yield None
         finally:
             if store_transfer_pending:
-                store_stream.synchronize()
+                self.store_stream.synchronize()
             if (
                 self.use_gpu
                 and tmp_gpu_buffer_obj is not None

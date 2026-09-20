@@ -4901,9 +4901,8 @@ def test_dense_batched_from_gpu_direct_path_passes_variable_chunk_metadata(
 
 
 @pytest.mark.parametrize("kv_group", [0, 1])
-@pytest.mark.parametrize("fifo_enabled", [False, True])
 def test_deferred_batched_from_gpu_rotates_two_banks_and_reports_completion(
-    monkeypatch, kv_group, fifo_enabled=False,
+    monkeypatch, kv_group,
 ) -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.num_layers = 4
@@ -4914,14 +4913,6 @@ def test_deferred_batched_from_gpu_rotates_two_banks_and_reports_completion(
     connector.kvcaches = [object(), object(), object(), object()]
     connector.use_gpu = True
     connector.store_stream = _TrackingStream("store")
-    connector.load_stream = _TrackingStream("fifo_dispatch")
-    connector._prefill_split_load_enabled = fifo_enabled
-    connector._prefill_split_load_queue = SimpleNamespace(
-        store_prepared=lambda *a, **kw: (
-            npu_connectors.dense_mla_dsa_batched_direct_kv_transfer_fast(*a, **kw)
-        ),
-    )
-    transfer_stream = connector.load_stream if fifo_enabled else connector.store_stream
     compute_stream = _TrackingStream("compute")
     events = [
         _TrackingEvent("layer-0"),
@@ -5060,10 +5051,8 @@ def test_deferred_batched_from_gpu_rotates_two_banks_and_reports_completion(
     assert generator.send({"slot_mapping": torch.tensor([20])}) is None
     assert generator.send({"slot_mapping": torch.tensor([30])}) is None
     assert generator.send({"slot_mapping": torch.tensor([40])}) is None
-    assert all(event.records == [transfer_stream.name] for event in events[:4])
-    assert "synchronize" not in transfer_stream.events
-    if fifo_enabled:
-        assert transfer_stream.events.count(("wait_stream", "store")) == 1
+    assert all(event.records == ["store"] for event in events[:4])
+    assert "synchronize" not in connector.store_stream.events
     assert next(generator) == 0
     assert next(generator) == 1
     assert next(generator) == 2
@@ -5079,11 +5068,11 @@ def test_deferred_batched_from_gpu_rotates_two_banks_and_reports_completion(
     ]
     assert state_calls == [(0, False), (1, False), (2, False), (3, False)]
     assert compute_stream.events == []
-    assert events[0].records == [transfer_stream.name]
-    assert events[1].records == [transfer_stream.name]
-    assert events[2].records == [transfer_stream.name]
-    assert events[3].records == [transfer_stream.name, "synchronize"]
-    assert "synchronize" not in transfer_stream.events
+    assert events[0].records == ["store"]
+    assert events[1].records == ["store"]
+    assert events[2].records == ["store"]
+    assert events[3].records == ["store", "synchronize"]
+    assert "synchronize" not in connector.store_stream.events
     assert connector._layerwise_prefill_bank_counts == {kv_group: 2}
     assert connector._layerwise_prefill_save_done_events == {
         (kv_group, 0): (0, events[2]),
@@ -5105,7 +5094,7 @@ def test_deferred_batched_from_gpu_rotates_two_banks_and_reports_completion(
     connector.reset_layerwise_prefill_transfer_state(kv_group, synchronize=False)
     with pytest.raises(RuntimeError, match="belongs to a reset step"):
         stale.send({"slot_mapping": torch.tensor([20])})
-    assert transfer_stream.events[-1] == "synchronize"
+    assert connector.store_stream.events[-1] == "synchronize"
     assert connector._layerwise_prefill_save_done_events == {}
 
 

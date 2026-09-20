@@ -1,18 +1,9 @@
 #pragma once
 #include "kernels/types.h"
 #include "managed_mem.h"
-#include "prefill_load_queue.h"
 #include "utils.h"
 #include <torch/extension.h>
 #include <torch/torch.h>
-
-void prefill_store_prepared(
-    const std::shared_ptr<PrefillLoadQueue> &queue,
-    const SparseDirectLayerState &state,
-    torch::Tensor &slots, torch::Tensor &ptrs,
-    torch::Tensor &offsets, torch::Tensor &sizes,
-    int64_t total_tokens, bool interleaved, bool direction,
-    bool validate_inputs = false, int64_t fixed_chunk_size = 0);
 
 namespace kvcache_ops {
 void multi_layer_kv_transfer_kernel(
@@ -304,14 +295,6 @@ void dense_mla_dsa_batched_direct_kv_transfer_prepared(
     torch::Tensor &chunk_offsets_npu, torch::Tensor &chunk_sizes_npu,
     const int64_t total_tokens, const bool lmc_host_interleaved,
     const bool validate_inputs = false, const int64_t fixed_chunk_size = 0);
-
-void prefill_split_load_prepared(
-    const std::shared_ptr<PrefillLoadQueue> &queue,
-    const SparseDirectDestinationState &destination_state,
-    torch::Tensor &slot_mapping_full, torch::Tensor &chunk_ptrs_npu,
-    torch::Tensor &chunk_offsets_npu, torch::Tensor &chunk_sizes_npu,
-    int64_t total_tokens, bool lmc_host_interleaved,
-    bool validate_inputs, int64_t fixed_chunk_size);
 
 // Group hot path: one host dispatch runs the existing per-layer direct kernel.
 void dense_mla_dsa_group_direct_kv_transfer_fast(

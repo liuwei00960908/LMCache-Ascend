@@ -177,7 +177,6 @@ def test_actual_deferred_generator_uses_probe_without_changing_protocol(
 
     def transfer(**kwargs):
         assert kwargs["direction"] is False
-        assert kwargs["prefill_load_queue"] is None
         assert kwargs["current_stream"] is stream
         assert kwargs["transfer_stream"] is stream
         selected = bank_mappings[kwargs["layer_id"] % 2] if banked else mapping
@@ -193,7 +192,6 @@ def test_actual_deferred_generator_uses_probe_without_changing_protocol(
     connector = SimpleNamespace(
         kvcaches=None,
         load_stream=stream,
-        _get_prefill_transfer_queue=lambda _: None,
         use_gpu=True,
         initialize_kvcaches_ptr=lambda **kw: None,
         _lazy_initialize_buffer_with_staging=lambda *a, **kw: layout,
