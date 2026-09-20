@@ -6,12 +6,15 @@
 // Reuse the production MLA/DSA copy implementation. Only the assigned token
 // interval changes. Keep six GM arguments (the index address is a scalar), as
 // in the original dense multi-chunk kernel.
+// Keep '*' attached to the type, matching the existing AscendC entrypoints.
+// CANN 8.5's launch generator otherwise forwards '*chunkPtrs', etc. as values.
+// clang-format off
 #define DEFINE_PREFILL_LOAD(TYPE, SLOT, FORMAT)                                \
   extern "C" __global__ __aicore__ void                                        \
   single_layer_paged_kv_copy_prefill_##TYPE##_##SLOT##_##FORMAT(                 \
-      __gm__ uint8_t *chunkPtrs, __gm__ uint8_t *chunkOffsets,                  \
-      __gm__ uint8_t *chunkSizes, __gm__ uint8_t *key,                          \
-      __gm__ uint8_t *value, __gm__ uint8_t *slots, uint64_t indexAddr,          \
+      __gm__ uint8_t* chunkPtrs, __gm__ uint8_t* chunkOffsets,                  \
+      __gm__ uint8_t* chunkSizes, __gm__ uint8_t* key,                          \
+      __gm__ uint8_t* value, __gm__ uint8_t* slots, uint64_t indexAddr,          \
       int64_t keyBytes, int64_t valueBytes, int64_t indexBytes,                 \
       int64_t kDims, int64_t vDims, int64_t indexDims,                          \
       int32_t maxTokensPerLoop, int32_t numTokens, int32_t numChunks,           \
@@ -36,6 +39,7 @@
                                 numChunks, fixedChunkSize, totalTokens);     \
     }                                                                        \
   }
+// clang-format on
 
 #define DEFINE_PREFILL_TYPE(TYPE)                 \
   DEFINE_PREFILL_LOAD(TYPE, int32_t, MLA_KV)       \
