@@ -50,6 +50,10 @@ from lmcache_ascend.v1.content_diagnostics import (
     register_group0_source_probe,
 )
 from lmcache_ascend.v1.kv_format import KVCacheFormat
+from lmcache_ascend.v1.npu_connector.layerwise_dma import (
+    bind_copy_addresses,
+    plan_bundle_copies,
+)
 from lmcache_ascend.v1.npu_connector.utils import (
     batched_fused_single_layer_kv_transfer,
     batched_fused_sparse_single_layer_kv_transfer,
@@ -236,6 +240,41 @@ def _cached_layerwise_slot_mapping(
     )
     cache[key] = (slot_mapping, chunks, full)
     return chunks, full, True
+
+
+def _prefill_dma_plans(
+    cpu_slots_by_bank: Sequence[torch.Tensor],
+    starts: Sequence[int],
+    ends: Sequence[int],
+    slot_mapping_base: int,
+    chunk_sizes: Sequence[int],
+    kv_group: int,
+    kvcaches: Sequence,
+) -> tuple:
+    """Plan both P-node banks once, before entering the model forward.
+
+    The P-only physical bundle is twice the natural 2/9-page DSA bundle.
+    Only CPU slot maps are inspected here; no device-to-host sync is needed.
+    """
+    if len(cpu_slots_by_bank) != 2:
+        raise ValueError("Layerwise prefill DMA requires two CPU bank maps")
+    if any(not plane.is_contiguous() for plane in kvcaches[0]):
+        raise ValueError("Layerwise prefill DMA requires contiguous NPU planes")
+    block_tokens = int(kvcaches[0][0].shape[1])
+    bundle_tokens = block_tokens * (4 if kv_group == 0 else 18)
+    slot_capacity = int(kvcaches[0][0].shape[0]) * block_tokens
+    plans = []
+    for slots in cpu_slots_by_bank:
+        if slots.device.type != "cpu":
+            raise ValueError("Layerwise prefill DMA needs CPU slot maps")
+        _, selected = _slice_layerwise_slot_mapping(
+            slots, starts, ends, slot_mapping_base, allow_view=True
+        )
+        plan = plan_bundle_copies(selected.tolist(), chunk_sizes, bundle_tokens)
+        if plan and max(s.slot + s.tokens for s in plan) > slot_capacity:
+            raise ValueError("Layerwise prefill DMA slot map exceeds NPU bank")
+        plans.append(plan)
+    return tuple(plans)
 
 
 def _payload_event_list(payload_event: Any) -> list[Any]:
@@ -5424,6 +5463,20 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             kwargs.get("deferred_layerwise_get", False)
         )
         deferred_dense_direct_get = deferred_layerwise_get and dense_direct
+        if kwargs.get("prefill_dma_cpu_slots_by_bank") is not None and not dense_direct:
+            raise RuntimeError("Layerwise prefill DMA requires dense direct load")
+        prefill_dma = bool(
+            deferred_dense_direct_get
+            and kwargs.get("prefill_dma_cpu_slots_by_bank") is not None
+        )
+        if prefill_dma and not hasattr(lmc_ops, "layerwise_prefill_dma_copy"):
+            raise RuntimeError(
+                "LMCache-Ascend must be rebuilt for layerwise prefill DMA"
+            )
+        if prefill_dma and layout.kv_format not in (
+            KVCacheFormat.MLA_LATENT, KVCacheFormat.DSA_INDEX
+        ):
+            raise ValueError("Layerwise prefill DMA requires two-group DSA KV")
         layerwise_prefill_bank_count = int(
             kwargs.get("layerwise_prefill_bank_count", 2) or 2
         )
@@ -5461,9 +5514,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             current_offset += chunk_size
 
         slot_mappings = {} if deferred_layerwise_get else None
+        setup_mapping = (
+            kwargs["prefill_dma_cpu_slots_by_bank"][0]
+            if prefill_dma else slot_mapping
+        )
         slot_mapping_chunks, slot_mapping_full, _ = _cached_layerwise_slot_mapping(
             slot_mappings,
-            slot_mapping,
+            setup_mapping,
             starts,
             ends,
         )
@@ -5492,7 +5549,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         chunk_offsets_npu: Optional[torch.Tensor] = None
         chunk_sizes_npu: Optional[torch.Tensor] = None
         dense_fixed_chunk_size = 0
-        if dense_direct:
+        dma_plans = None
+        if prefill_dma:
+            dma_plans = _prefill_dma_plans(
+                kwargs["prefill_dma_cpu_slots_by_bank"], starts, ends, 0,
+                chunk_sizes, kv_group, kvcaches_snapshot,
+            )
+        if dense_direct and not prefill_dma:
             (
                 dense_fixed_chunk_size,
                 chunk_offsets_npu,
@@ -5553,7 +5616,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     layer_request = layer_payload.get("layer_request")
                 else:
                     memory_objs_layer = layer_payload
-                if layer_request is None:
+                if prefill_dma:
+                    # Both bank plans were built from CPU slot maps before
+                    # forward; do not slice/cat device maps in this callback.
+                    layer_slot_mapping_chunks = slot_mapping_chunks
+                    layer_slot_mapping_full = slot_mapping_full
+                    new_mapping = False
+                elif layer_request is None:
                     # D-side loads use one immutable map. Reuse the exact tensor
                     # prepared (and, if needed, copied to the NPU) above: the
                     # deferred-load stream dependency and layer-0 record_stream
@@ -5601,18 +5670,19 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     raise ValueError(f"Expected memory format {expected_fmt}.")
                 validated_page_ids.update(map(id, page_checks))
                 pointer_first = dense_direct and bool(source_objs)
-                cpu_tensors = (
-                    [_layer_memory_tensor(source_objs[0], layer_id)]
-                    if pointer_first
-                    else _layer_source_tensors(
+                if prefill_dma:
+                    cpu_tensors = []
+                elif pointer_first:
+                    cpu_tensors = [_layer_memory_tensor(source_objs[0], layer_id)]
+                else:
+                    cpu_tensors = _layer_source_tensors(
                         memory_objs_layer, layer_id, expected_fmt
                     )
-                )
-                # The generator is resumed from vLLM's attention path; refresh the
-                # active compute stream per layer before ordering load -> compute.
+                # Ordinary paths need the active compute stream per layer.
+                # Deferred DMA uses bank events and never queries that stream.
                 current_stream = (
                     self.load_stream
-                    if defer_dense_waits
+                    if defer_dense_waits or prefill_dma
                     else torch.cuda.current_stream()
                 )
                 if sync and not defer_dense_waits and not deferred_dense_direct_get:
@@ -5620,7 +5690,45 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 if layer_id > 0 and logger.isEnabledFor(10):
                     logger.debug("Finished loading layer %d", layer_id - 1)
                 # memobj -> gpu_buffer -> kvcaches
-                if dense_direct:
+                if prefill_dma:
+                    assert dma_plans is not None
+                    bank = self._layerwise_prefill_bank(layer_id, kv_group)
+                    _, _, save_done, _ = self._layerwise_prefill_transfer_state()
+                    previous_save = save_done.get((kv_group, bank))
+                    copies = bind_copy_addresses(
+                        dma_plans[bank],
+                        [
+                            int(obj.layer_data_ptr(layer_id))
+                            if isinstance(obj, LayerPageMemoryObj)
+                            else int(obj.data_ptr)
+                            for obj in source_objs
+                        ],
+                        [int(t.data_ptr()) for t in kvcaches_snapshot[layer_id]],
+                        chunk_sizes, self.checkpoint_plane_widths(kv_group),
+                        int(kvcaches_snapshot[layer_id][0].element_size()),
+                        device_to_host=False,
+                        host_chunk_tokens=[
+                            self._lmc_plane_num_tokens(
+                                _layer_memory_tensor(obj, layer_id), kv_group
+                            )
+                            for obj in source_objs
+                        ],
+                    )
+                    with torch.npu.stream(self.load_stream):
+                        if (
+                            previous_save is not None
+                            and previous_save[0] == layerwise_prefill_generation
+                        ):
+                            self.load_stream.wait_event(previous_save[1])
+                        deferred_load_submitted = True
+                        lmc_ops.layerwise_prefill_dma_copy(copies, False)
+                    load_done_event = torch.npu.Event()
+                    load_done_event.record(self.load_stream)
+                    _, _, _, load_done = self._layerwise_prefill_transfer_state()
+                    load_done[(kv_group, layer_id)] = (
+                        layerwise_prefill_generation, load_done_event,
+                    )
+                elif dense_direct:
                     if deferred_dense_direct_get:
                         bank = self._layerwise_prefill_bank(layer_id, kv_group)
                         _, _, save_done, _ = (
@@ -6711,13 +6819,31 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             current_offset += chunk_size
 
         deferred_layerwise_put = bool(kwargs.get("deferred_layerwise_put", False))
+        prefill_dma = bool(
+            deferred_layerwise_put and dense_direct
+            and kwargs.get("prefill_dma_cpu_slots_by_bank") is not None
+        )
+        if kwargs.get("prefill_dma_cpu_slots_by_bank") is not None and not dense_direct:
+            raise RuntimeError("Layerwise prefill DMA requires dense direct store")
+        if prefill_dma and not hasattr(lmc_ops, "layerwise_prefill_dma_copy"):
+            raise RuntimeError(
+                "LMCache-Ascend must be rebuilt for layerwise prefill DMA"
+            )
+        if prefill_dma and layout.kv_format not in (
+            KVCacheFormat.MLA_LATENT, KVCacheFormat.DSA_INDEX
+        ):
+            raise ValueError("Layerwise prefill DMA requires two-group DSA KV")
         slot_mappings = {} if deferred_layerwise_put else None
+        setup_mapping = (
+            kwargs["prefill_dma_cpu_slots_by_bank"][0]
+            if prefill_dma else slot_mapping
+        )
         slot_mapping_chunks, slot_mapping_full, _ = _cached_layerwise_slot_mapping(
             slot_mappings,
-            slot_mapping,
+            setup_mapping,
             starts,
             ends,
-            slot_mapping_base,
+            0 if prefill_dma else slot_mapping_base,
         )
 
         num_tokens = len(slot_mapping_full)
@@ -6727,7 +6853,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             slot_mapping_full=slot_mapping_full,
             kvcaches_ref=kvcaches_snapshot,
         )
-        if dense_direct:
+        if dense_direct and not prefill_dma:
             slot_mapping_full = self._slot_mapping_on_kv_device(
                 slot_mapping_full, self.store_stream
             )
@@ -6747,7 +6873,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         chunk_offsets_npu: Optional[torch.Tensor] = None
         chunk_sizes_npu: Optional[torch.Tensor] = None
         dense_fixed_chunk_size = 0
-        if dense_direct:
+        dma_plans = None
+        if prefill_dma:
+            dma_plans = _prefill_dma_plans(
+                kwargs["prefill_dma_cpu_slots_by_bank"], starts, ends,
+                0, chunk_sizes, kv_group, kvcaches_snapshot,
+            )
+        if dense_direct and not prefill_dma:
             (
                 dense_fixed_chunk_size,
                 chunk_offsets_npu,
@@ -6871,15 +7003,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 layerwise_prefill_generation = None
 
             # Deferred P-node saves are resumed from the latency-sensitive
-            # pre-HCOM callback.  Resolve every registered host pointer, upload
-            # one dense pointer table, and build every native layer state now,
-            # before the generator's priming yield.  The per-layer callback may
-            # then only select an already prepared row and launch the transfer.
+            # pre-HCOM callback. Prepare either DMA address rows or the legacy
+            # dense-direct native states before the generator's priming yield.
             deferred_dense_layer_tensors: Optional[List[List[torch.Tensor]]] = None
             deferred_dense_chunk_dev_ptrs: List[List[int]] = []
             deferred_dense_chunk_ptrs_npu: List[Optional[torch.Tensor]] = []
             deferred_dense_layer_states: List[Any] = []
             deferred_dense_validation_keys: List[tuple] = []
+            deferred_dma_copies: List[List[tuple[int, int, int]]] = []
             if deferred_layerwise_put and dense_direct:
                 deferred_dense_layer_tensors = []
                 for layer_id, memory_objs_layer in enumerate(memory_objs):
@@ -6906,16 +7037,37 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         )
                     deferred_dense_layer_tensors.append(layer_tensors)
 
-                self.append_sparse_chunk_ptr_cache_for_layers(
-                    memory_objs,
-                    deferred_dense_chunk_dev_ptrs,
-                    deferred_dense_chunk_ptrs_npu,
-                    kv_group=kv_group,
-                )
-                assert chunk_offsets_npu is not None
-                assert chunk_sizes_npu is not None
+                if prefill_dma:
+                    assert dma_plans is not None
+                    widths = self.checkpoint_plane_widths(kv_group)
+                    host_chunk_tokens = [
+                        int(t.numel()) // sum(widths)
+                        for t in deferred_dense_layer_tensors[0]
+                    ]
+                    for layer_id, layer_tensors in enumerate(
+                        deferred_dense_layer_tensors
+                    ):
+                        deferred_dma_copies.append(bind_copy_addresses(
+                            dma_plans[layer_id % 2],
+                            [int(t.data_ptr()) for t in layer_tensors],
+                            [int(t.data_ptr()) for t in kvcaches_snapshot[layer_id]],
+                            chunk_sizes, widths,
+                            int(kvcaches_snapshot[layer_id][0].element_size()),
+                            device_to_host=True,
+                            host_chunk_tokens=host_chunk_tokens,
+                        ))
+
+                if not prefill_dma:
+                    self.append_sparse_chunk_ptr_cache_for_layers(
+                        memory_objs,
+                        deferred_dense_chunk_dev_ptrs,
+                        deferred_dense_chunk_ptrs_npu,
+                        kv_group=kv_group,
+                    )
+                    assert chunk_offsets_npu is not None
+                    assert chunk_sizes_npu is not None
                 for layer_id, layer_tensors in enumerate(
-                    deferred_dense_layer_tensors
+                    deferred_dense_layer_tensors if not prefill_dma else ()
                 ):
                     chunk_ptrs_npu = deferred_dense_chunk_ptrs_npu[layer_id]
                     if chunk_ptrs_npu is None:
@@ -6983,7 +7135,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 current_stream = torch.npu.current_stream()
                 bank = layer_id % source_bank_count
 
-                if layer_request is None:
+                if prefill_dma:
+                    # The raw-address plan already selects the physical bank.
+                    layer_slot_mapping_chunks = slot_mapping_chunks
+                    layer_slot_mapping_full = slot_mapping_full
+                    new_mapping = False
+                elif layer_request is None:
                     # Ordinary stores keep one mapping for every layer. Reuse
                     # its prepared device tensor, including CPU-to-NPU copies.
                     layer_slot_mapping_chunks = slot_mapping_chunks
@@ -7022,7 +7179,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 # Mark before launching so exception cleanup also fences a
                 # partially enqueued transfer.
                 store_transfer_pending = True
-                if dense_direct:
+                if prefill_dma:
+                    with torch.npu.stream(self.store_stream):
+                        self.store_stream.wait_stream(current_stream)
+                        lmc_ops.layerwise_prefill_dma_copy(
+                            deferred_dma_copies[layer_id], True
+                        )
+                elif dense_direct:
                     if deferred_layerwise_put:
                         assert deferred_dense_layer_tensors is not None
                         cpu_tensors = deferred_dense_layer_tensors[layer_id]

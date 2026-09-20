@@ -6,9 +6,12 @@
 #include "mem_alloc.h"
 #include "mem_kernels.h"
 #include "pos_kernels.h"
+#include <cstdint>
 #include <iostream>
+#include <tuple>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <torch_npu/csrc/core/npu/NPUStream.h>
 #include <torch/csrc/autograd/python_variable.h>
 #include <torch/torch.h>
 
@@ -236,6 +239,23 @@ py::tuple dense_mla_dsa_group_direct_kv_transfer_fast_wrapper(
 }
 
 PYBIND11_MODULE(c_ops, m) {
+  m.def("layerwise_prefill_dma_copy",
+        [](const std::vector<std::tuple<uintptr_t, uintptr_t, size_t>> &copies,
+           bool device_to_host) {
+          const auto stream = c10_npu::getCurrentNPUStream().stream();
+          const auto kind = device_to_host ? ACL_MEMCPY_DEVICE_TO_HOST
+                                           : ACL_MEMCPY_HOST_TO_DEVICE;
+          py::gil_scoped_release release;
+          for (const auto &[dst, src, bytes] : copies) {
+            const aclError status = aclrtMemcpyAsync(
+                reinterpret_cast<void *>(dst), bytes,
+                reinterpret_cast<void *>(src), bytes, kind, stream);
+            TORCH_CHECK(status == ACL_ERROR_NONE,
+                        "Layerwise prefill DMA submission failed: ret=", status,
+                        " bytes=", bytes);
+          }
+        },
+        py::arg("copies"), py::arg("device_to_host"));
   m.def("dense_mla_dsa_group_direct_kv_transfer_prepared",
         [](const py::sequence &objects, torch::Tensor &slots,
            torch::Tensor &pointers, torch::Tensor &offsets,
