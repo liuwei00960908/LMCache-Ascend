@@ -1611,7 +1611,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     owned[identity] = obj
 
     def release_layerwise_prefill_pages(self, req_id: str) -> None:
-        """Release one request's extra CPU-page references.
+        """Release one request's CPU pages and cached DMA bindings.
 
         Args:
             req_id: Completed or cancelled request identifier.
@@ -1619,6 +1619,13 @@ class AscendLMCacheEngine(LMCacheEngine):
         Repeated calls are harmless. Remote puts retain their own source
         references until completion; this only ends the request's LRU lease.
         """
+        release_dma = getattr(
+            getattr(self, "gpu_connector", None),
+            "release_layerwise_prefill_dma_cache",
+            None,
+        )
+        if release_dma is not None:
+            release_dma(req_id)
         with self._engine_state_lock:
             owned = self._layerwise_prefill_page_owners.pop(req_id, None)
         if owned is not None:

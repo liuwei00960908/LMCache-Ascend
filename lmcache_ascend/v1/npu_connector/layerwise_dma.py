@@ -1,9 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
 """CPU tensor-only planning and address binding for layerwise prefill DMA."""
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Callable, Sequence
 
 import torch
 
@@ -115,6 +117,88 @@ class DmaCycle:
         return DmaPlan(
             chunk, slots[begin - slot_mapping_base], begin - starts[chunk], stop - begin
         )
+
+
+@dataclass(frozen=True)
+class BoundCopyPrefix:
+    """Previously bound H2D rows for one request/group/layer/bank."""
+
+    owners: tuple[object, ...]
+    owner_ids: tuple[int, ...]
+    starts: tuple[int, ...]
+    ends: tuple[int, ...]
+    npu_ptrs: tuple[int, ...]
+    plane_widths: tuple[int, ...]
+    element_bytes: int
+    rows: list[list[int]]
+
+
+def bind_incremental_copy_addresses(
+    plan: DmaPlan,
+    source_objs: Sequence[object],
+    starts: Sequence[int],
+    ends: Sequence[int],
+    npu_ptrs: Sequence[int],
+    plane_widths: Sequence[int],
+    element_bytes: int,
+    host_ptr: Callable[[object], int],
+    host_tokens: Callable[[object], int],
+    previous: BoundCopyPrefix | None,
+    *,
+    slot_prefix_unchanged: bool,
+) -> BoundCopyPrefix:
+    """Reuse bound rows for an unchanged prefix; bind only appended chunks."""
+    npu_ptrs = tuple(npu_ptrs)
+    plane_widths = tuple(plane_widths)
+    old_count = len(previous.owners) if previous is not None else 0
+    reuse = bool(
+        slot_prefix_unchanged
+        and previous is not None
+        and old_count <= len(source_objs)
+        and tuple(map(id, source_objs[:old_count])) == previous.owner_ids
+        and tuple(starts[:old_count]) == previous.starts
+        and tuple(ends[:old_count]) == previous.ends
+        and npu_ptrs == previous.npu_ptrs
+        and plane_widths == previous.plane_widths
+        and element_bytes == previous.element_bytes
+    )
+    begin_chunk = old_count if reuse else 0
+    first_segment = int(torch.searchsorted(plan.chunk, begin_chunk))
+    suffix_plan = DmaPlan(
+        plan.chunk[first_segment:] - begin_chunk,
+        plan.slot[first_segment:],
+        plan.chunk_token[first_segment:],
+        plan.tokens[first_segment:],
+    )
+    suffix_objs = source_objs[begin_chunk:]
+    suffix_rows = (
+        bind_copy_addresses(
+            suffix_plan,
+            list(map(host_ptr, suffix_objs)),
+            npu_ptrs,
+            (
+                torch.as_tensor(ends[begin_chunk:])
+                - torch.as_tensor(starts[begin_chunk:])
+            ).tolist(),
+            plane_widths,
+            element_bytes,
+            device_to_host=False,
+            host_chunk_tokens=list(map(host_tokens, suffix_objs)),
+        )
+        if suffix_objs
+        else []
+    )
+    rows = previous.rows + suffix_rows if reuse else suffix_rows
+    return BoundCopyPrefix(
+        owners=tuple(source_objs),
+        owner_ids=tuple(map(id, source_objs)),
+        starts=tuple(starts),
+        ends=tuple(ends),
+        npu_ptrs=npu_ptrs,
+        plane_widths=plane_widths,
+        element_bytes=element_bytes,
+        rows=rows,
+    )
 
 
 def plan_bundle_copies(slots, chunk_sizes, bundle_tokens) -> DmaPlan:

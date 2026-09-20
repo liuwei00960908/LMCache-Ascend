@@ -53,7 +53,9 @@ from lmcache_ascend.v1.content_diagnostics import (
 )
 from lmcache_ascend.v1.kv_format import KVCacheFormat
 from lmcache_ascend.v1.npu_connector.layerwise_dma import (
+    BoundCopyPrefix,
     bind_copy_addresses,
+    bind_incremental_copy_addresses,
 )
 from lmcache_ascend.v1.npu_connector.utils import (
     batched_fused_single_layer_kv_transfer,
@@ -1927,6 +1929,17 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self._layerwise_prefill_load_done_events: dict[
             tuple[int, int], tuple[int, Any]
         ] = {}
+        self._prefill_dma_bound_loads: dict[
+            str, dict[tuple[int, int], BoundCopyPrefix]
+        ] = {}
+        self._prefill_dma_slot_snapshots: dict[
+            str, dict[tuple[int, int], torch.Tensor]
+        ] = {}
+
+    def release_layerwise_prefill_dma_cache(self, req_id: str) -> None:
+        """Discard one finished request's historical H2D address bindings."""
+        self._prefill_dma_bound_loads.pop(req_id, None)
+        self._prefill_dma_slot_snapshots.pop(req_id, None)
 
     def supports_dense_sparse_cache_retention(self) -> bool:
         return not _DENSE_DIRECT_LOAD_DISABLE
@@ -2068,6 +2081,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if synchronize:
             self.load_stream.synchronize()
             self.store_stream.synchronize()
+        # An aborted/restarted transfer can reuse the request ID with new
+        # pages or block mappings. Never carry bound addresses across reset.
+        getattr(self, "_prefill_dma_bound_loads", {}).clear()
+        getattr(self, "_prefill_dma_slot_snapshots", {}).clear()
 
         bank_counts, generations, save_done, load_done = (
             self._layerwise_prefill_transfer_state()
@@ -5599,12 +5616,34 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         chunk_sizes_npu: Optional[torch.Tensor] = None
         dense_fixed_chunk_size = 0
         dma_plans = None
+        dma_req_id = kwargs.get("req_id") if prefill_dma else None
+        bound_loads = None
         if prefill_dma:
             dma_plans = _prefill_dma_plans(
                 kwargs["prefill_dma_cpu_slots_by_bank"], starts, ends, 0,
                 chunk_sizes, kv_group, kvcaches_snapshot, "load",
                 self.prefill_dma_cycles[kv_group],
             )
+            if isinstance(dma_req_id, str) and dma_req_id:
+                bound_loads = self._prefill_dma_bound_loads.setdefault(
+                    dma_req_id, {}
+                )
+                slot_snapshots = self._prefill_dma_slot_snapshots.setdefault(
+                    dma_req_id, {}
+                )
+                for bank, slots in enumerate(
+                    kwargs["prefill_dma_cpu_slots_by_bank"]
+                ):
+                    old_slots = slot_snapshots.get((kv_group, bank))
+                    if old_slots is None or (
+                        len(slots) < len(old_slots)
+                        or not torch.equal(old_slots, slots[:len(old_slots)])
+                    ):
+                        for cache_key in tuple(bound_loads):
+                            if (cache_key[0] == kv_group
+                                    and cache_key[1] % 2 == bank):
+                                bound_loads.pop(cache_key)
+                    slot_snapshots[(kv_group, bank)] = slots.clone()
         if dense_direct and not prefill_dma:
             (
                 dense_fixed_chunk_size,
@@ -5745,25 +5784,28 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     bank = self._layerwise_prefill_bank(layer_id, kv_group)
                     _, _, save_done, _ = self._layerwise_prefill_transfer_state()
                     previous_save = save_done.get((kv_group, bank))
-                    copies = bind_copy_addresses(
-                        dma_plans[bank],
-                        [
+                    bound = bind_incremental_copy_addresses(
+                        dma_plans[bank], source_objs, starts, ends,
+                        [int(t.data_ptr()) for t in kvcaches_snapshot[layer_id]],
+                        self.checkpoint_plane_widths(kv_group),
+                        int(kvcaches_snapshot[layer_id][0].element_size()),
+                        lambda obj, layer_id=layer_id: (
                             int(obj.layer_data_ptr(layer_id))
                             if isinstance(obj, LayerPageMemoryObj)
                             else int(obj.data_ptr)
-                            for obj in source_objs
-                        ],
-                        [int(t.data_ptr()) for t in kvcaches_snapshot[layer_id]],
-                        chunk_sizes, self.checkpoint_plane_widths(kv_group),
-                        int(kvcaches_snapshot[layer_id][0].element_size()),
-                        device_to_host=False,
-                        host_chunk_tokens=[
-                            self._lmc_plane_num_tokens(
-                                _layer_memory_tensor(obj, layer_id), kv_group
-                            )
-                            for obj in source_objs
-                        ],
+                        ),
+                        lambda obj, layer_id=layer_id: self._lmc_plane_num_tokens(
+                            _layer_memory_tensor(obj, layer_id), kv_group
+                        ),
+                        (
+                            bound_loads.get((kv_group, layer_id))
+                            if bound_loads is not None else None
+                        ),
+                        slot_prefix_unchanged=bound_loads is not None,
                     )
+                    if bound_loads is not None:
+                        bound_loads[(kv_group, layer_id)] = bound
+                    copies = bound.rows
                     with torch.npu.stream(self.load_stream):
                         if (
                             previous_save is not None

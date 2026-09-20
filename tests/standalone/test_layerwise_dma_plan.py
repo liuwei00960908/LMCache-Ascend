@@ -152,6 +152,138 @@ def test_no_python_loops_in_dma_planner_or_binding():
     )
 
 
+def test_incremental_binding_reuses_history_and_matches_full_rebind():
+    cycle = module.DmaCycle.build(bundle_tokens=4, chunk_tokens=3)
+    slots = torch.arange(12)
+    owners = [object() for _ in range(3)]
+    host_addresses = {id(owner): 10000 + i * 1000 for i, owner in enumerate(owners)}
+    observed = []
+
+    def host_ptr(owner):
+        observed.append(owner)
+        return host_addresses[id(owner)]
+
+    def host_tokens(_owner):
+        return 3
+
+    first_plan = cycle.plan_ranges(slots, [0, 3], [3, 6])
+    first = module.bind_incremental_copy_addresses(
+        first_plan,
+        owners[:2],
+        [0, 3],
+        [3, 6],
+        [20000],
+        [16],
+        2,
+        host_ptr,
+        host_tokens,
+        None,
+        slot_prefix_unchanged=False,
+    )
+    assert observed == owners[:2]
+    observed.clear()
+    full_plan = cycle.plan_ranges(slots, [0, 3, 6], [3, 6, 9])
+    second = module.bind_incremental_copy_addresses(
+        full_plan,
+        owners,
+        [0, 3, 6],
+        [3, 6, 9],
+        [20000],
+        [16],
+        2,
+        host_ptr,
+        host_tokens,
+        first,
+        slot_prefix_unchanged=True,
+    )
+    assert observed == owners[2:]
+    expected = bind_copy_addresses(
+        full_plan,
+        list(host_addresses.values()),
+        [20000],
+        [3, 3, 3],
+        [16],
+        2,
+        device_to_host=False,
+    )
+    assert second.rows == expected
+
+
+def test_incremental_binding_rebinds_changed_tail_or_npu_address():
+    cycle = module.DmaCycle.build(bundle_tokens=4, chunk_tokens=3)
+    slots = torch.arange(9)
+    owners = [object() for _ in range(3)]
+    addresses = {id(owner): 10000 + i * 1000 for i, owner in enumerate(owners)}
+    observed = []
+
+    def host_ptr(owner):
+        observed.append(owner)
+        return addresses[id(owner)]
+
+    def bind(current_owners, starts, ends, npu_ptr, previous, stable):
+        plan = cycle.plan_ranges(slots, starts, ends)
+        return module.bind_incremental_copy_addresses(
+            plan,
+            current_owners,
+            starts,
+            ends,
+            [npu_ptr],
+            [16],
+            2,
+            host_ptr,
+            lambda _owner: 3,
+            previous,
+            slot_prefix_unchanged=stable,
+        )
+
+    first = bind(owners[:2], [0, 3], [3, 6], 20000, None, False)
+    observed.clear()
+    replaced = bind([owners[0], owners[2]], [0, 3], [3, 6], 20000, first, True)
+    assert observed == [owners[0], owners[2]]
+    observed.clear()
+    bind([owners[0], owners[2]], [0, 3], [3, 6], 30000, replaced, True)
+    assert observed == [owners[0], owners[2]]
+
+
+@pytest.mark.parametrize("bundle,internal", [(512, None), (2304, [2048])])
+def test_incremental_binding_matches_80k_full_plan(bundle, internal):
+    cycle = module.DmaCycle.build(bundle, 1024, internal)
+    starts = list(range(0, 81920, 1024))
+    ends = [start + 1024 for start in starts]
+    slots = torch.arange(81920)
+    owners = [object() for _ in starts]
+    ptrs = {id(owner): 1000000 + i * 16384 for i, owner in enumerate(owners)}
+
+    def bind(count, previous):
+        plan = cycle.plan_ranges(slots, starts[:count], ends[:count])
+        return module.bind_incremental_copy_addresses(
+            plan,
+            owners[:count],
+            starts[:count],
+            ends[:count],
+            [2000000, 3000000],
+            [576, 128],
+            2,
+            lambda owner: ptrs[id(owner)],
+            lambda _owner: 1024,
+            previous,
+            slot_prefix_unchanged=True,
+        )
+
+    previous = bind(76, None)
+    current = bind(80, previous)
+    full = bind_copy_addresses(
+        cycle.plan_ranges(slots, starts, ends),
+        [ptrs[id(owner)] for owner in owners],
+        [2000000, 3000000],
+        [1024] * 80,
+        [576, 128],
+        2,
+        device_to_host=False,
+    )
+    assert current.rows == full
+
+
 def test_indexer_split_slabs_never_cross_a_dma_segment():
     _, cycle = module.build_group_cycles(
         torch.empty((2, 128, 576)), torch.empty((2, 128, 128)), 1024, 2, (512, 64)
