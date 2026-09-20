@@ -491,6 +491,10 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
         self._direct_store_states: dict[str, _DirectStoreRequestState] = {}
         self._layerwise_put_queue = None
+        # Keep P-node continuation-prefill pages allocator-owned until the
+        # request finishes. A Python reference alone does not stop LRU eviction;
+        # an extra MemoryObj ref_count does, without PinMonitor's timeout.
+        self._layerwise_prefill_page_owners: dict[str, dict[int, MemoryObj]] = {}
         self._layerwise_cpu_fill_sources: dict[
             str, dict[int, tuple[_DirectPageBatch, LayerwiseCPUFillLease]]
         ] = {}
@@ -1593,6 +1597,33 @@ class AscendLMCacheEngine(LMCacheEngine):
         state.committed_end[group] = max(
             state.committed_end.get(group, 0), result.committed_end
         )
+
+    def _retain_layerwise_prefill_pages(
+        self, req_id: str, memory_objs: Iterable[MemoryObj]
+    ) -> None:
+        """Hold one allocator reference per physical page for this request."""
+        with self._engine_state_lock:
+            owned = self._layerwise_prefill_page_owners.setdefault(req_id, {})
+            for obj in memory_objs:
+                identity = id(obj)
+                if identity not in owned:
+                    obj.ref_count_up()
+                    owned[identity] = obj
+
+    def release_layerwise_prefill_pages(self, req_id: str) -> None:
+        """Release one request's extra CPU-page references.
+
+        Args:
+            req_id: Completed or cancelled request identifier.
+
+        Repeated calls are harmless. Remote puts retain their own source
+        references until completion; this only ends the request's LRU lease.
+        """
+        with self._engine_state_lock:
+            owned = self._layerwise_prefill_page_owners.pop(req_id, None)
+        if owned is not None:
+            for obj in owned.values():
+                obj.ref_count_down()
 
     def poll_layerwise_prefill_puts(
         self, *, final: bool = False, req_ids: Optional[Iterable[str]] = None
@@ -6567,7 +6598,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                     1,
                     self._num_layers_for_kv_group(kv_group),
                     memory_format,
-                    busy_loop=force_store_wait,
+                    busy_loop=(
+                        force_store_wait and not self._force_layerwise_prefill_store
+                    ),
                     valid_tokens=num_tokens,
                     full_tokens=int(self.config.chunk_size),
                 )
@@ -6601,10 +6634,25 @@ class AscendLMCacheEngine(LMCacheEngine):
                     kv_dtype,
                     batch_size=self._num_layers_for_kv_group(kv_group),
                     fmt=memory_format,
-                    busy_loop=force_store_wait,
+                    busy_loop=(
+                        force_store_wait and not self._force_layerwise_prefill_store
+                    ),
                 )
 
             if memory_objs_multi_layer is None:
+                if self._force_layerwise_prefill_store:
+                    for obj in {
+                        id(item): item
+                        for layer_objs in memory_objs
+                        for item in layer_objs
+                    }.values():
+                        obj.ref_count_down()
+                    raise RuntimeError(
+                        "Layerwise prefill CPU cache is full while request "
+                        f"{req_id} is active; request-owned pages cannot be "
+                        "evicted. Increase CPU cache capacity or reduce "
+                        "concurrent/maximum prompt length."
+                    )
                 logger.warning(
                     "Local cpu memory under pressure so"
                     " choosing to not store the KV cache."
@@ -6738,6 +6786,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                 for layer_objs in memory_objs
                 for mem_obj in layer_objs
             }
+            if self._force_layerwise_prefill_store:
+                self._retain_layerwise_prefill_pages(
+                    req_id, pending_store_release.values()
+                )
             mem_obj_generator = None
 
             # Calculate total KV size for logging
@@ -10666,4 +10718,6 @@ class AscendLMCacheEngine(LMCacheEngine):
             except Exception:
                 logger.exception("Error stopping Ascend store worker")
 
+        for req_id in tuple(self._layerwise_prefill_page_owners):
+            self.release_layerwise_prefill_pages(req_id)
         super().close()
