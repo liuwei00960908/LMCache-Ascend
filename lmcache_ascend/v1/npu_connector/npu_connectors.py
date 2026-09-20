@@ -18,6 +18,8 @@ from lmcache.integration.vllm.utils import ENGINE_NAME
 from lmcache.logging import init_logger
 from lmcache.utils import _lmcache_nvtx_annotate
 from lmcache.v1.serving_perf import (
+    prefill_start_timing_enabled,
+    prefill_start_timing_log,
     serving_perf_detailed_enabled,
     serving_perf_enabled,
     serving_perf_log,
@@ -250,12 +252,14 @@ def _prefill_dma_plans(
     chunk_sizes: Sequence[int],
     kv_group: int,
     kvcaches: Sequence,
+    direction: str,
 ) -> tuple:
     """Plan both P-node banks once, before entering the model forward.
 
     The P-only physical bundle is twice the natural 2/9-page DSA bundle.
     Only CPU slot maps are inspected here; no device-to-host sync is needed.
     """
+    started = time.perf_counter() if prefill_start_timing_enabled() else 0.0
     if len(cpu_slots_by_bank) != 2:
         raise ValueError("Layerwise prefill DMA requires two CPU bank maps")
     if any(not plane.is_contiguous() for plane in kvcaches[0]):
@@ -274,6 +278,12 @@ def _prefill_dma_plans(
         if plan and max(s.slot + s.tokens for s in plan) > slot_capacity:
             raise ValueError("Layerwise prefill DMA slot map exceeds NPU bank")
         plans.append(plan)
+    if started:
+        prefill_start_timing_log(
+            logger, "dma_plan", started, direction=direction,
+            kv_group=kv_group, tokens=sum(chunk_sizes),
+            segments_by_bank=[len(plan) for plan in plans],
+        )
     return tuple(plans)
 
 
@@ -2127,11 +2137,34 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         current_stream = torch.npu.current_stream()
         bank = self._layerwise_prefill_bank(layer_id, kv_group)
         save_record = save_done.get((kv_group, bank))
+        diagnose_first_bank = prefill_start_timing_enabled() and layer_id == 0
+        if diagnose_first_bank:
+            wait_started = time.perf_counter()
+            device_wait_start = torch.npu.Event(enable_timing=True)
+            device_wait_end = torch.npu.Event(enable_timing=True)
+            device_wait_start.record(current_stream)
         if save_record is not None and save_record[0] == generation:
             current_stream.wait_event(save_record[1])
         load_record = load_done.pop((kv_group, int(layer_id)), None)
         if load_record is not None and load_record[0] == generation:
             current_stream.wait_event(load_record[1])
+        if diagnose_first_bank:
+            device_wait_end.record(current_stream)
+            # Diagnostic mode only: this is the first consumer's required
+            # dependency. Synchronize its event to distinguish a device-side
+            # H2D wait from CPU setup hidden under mla_forward in the trace.
+            device_wait_end.synchronize()
+            prefill_start_timing_log(
+                logger, "first_bank_wait", wait_started,
+                kv_group=kv_group, layer_id=layer_id, bank=bank,
+                save_event=save_record is not None
+                and save_record[0] == generation,
+                load_event=load_record is not None
+                and load_record[0] == generation,
+                device_wait_ms=round(
+                    device_wait_start.elapsed_time(device_wait_end), 3
+                ),
+            )
 
     @contextmanager
     def defer_sparse_load_consumer_wait(self) -> Generator[None, None, None]:
@@ -5553,7 +5586,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if prefill_dma:
             dma_plans = _prefill_dma_plans(
                 kwargs["prefill_dma_cpu_slots_by_bank"], starts, ends, 0,
-                chunk_sizes, kv_group, kvcaches_snapshot,
+                chunk_sizes, kv_group, kvcaches_snapshot, "load",
             )
         if dense_direct and not prefill_dma:
             (
@@ -6877,7 +6910,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if prefill_dma:
             dma_plans = _prefill_dma_plans(
                 kwargs["prefill_dma_cpu_slots_by_bank"], starts, ends,
-                0, chunk_sizes, kv_group, kvcaches_snapshot,
+                0, chunk_sizes, kv_group, kvcaches_snapshot, "store",
             )
         if dense_direct and not prefill_dma:
             (
