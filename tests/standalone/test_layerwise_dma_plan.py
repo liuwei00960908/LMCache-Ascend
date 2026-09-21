@@ -239,10 +239,93 @@ def test_incremental_binding_rebinds_changed_tail_or_npu_address():
     first = bind(owners[:2], [0, 3], [3, 6], 20000, None, False)
     observed.clear()
     replaced = bind([owners[0], owners[2]], [0, 3], [3, 6], 20000, first, True)
-    assert observed == [owners[0], owners[2]]
+    assert observed == [owners[2]]
     observed.clear()
     bind([owners[0], owners[2]], [0, 3], [3, 6], 30000, replaced, True)
     assert observed == [owners[0], owners[2]]
+
+
+def test_incremental_binding_replaces_only_grown_terminal_chunk():
+    cycle = module.DmaCycle.build(2304, 8192, [2048])
+    slots = torch.arange(16384)
+    owners = [object(), object()]
+    addresses = {id(owner): 100000 + i * 20000 for i, owner in enumerate(owners)}
+    observed = []
+
+    def host_ptr(owner):
+        observed.append(owner)
+        return addresses[id(owner)]
+
+    def bind(ends, previous):
+        plan = cycle.plan_ranges(slots, [0, 8192], ends)
+        return module.bind_incremental_copy_addresses(
+            plan,
+            owners,
+            [0, 8192],
+            ends,
+            [500000],
+            [128],
+            2,
+            host_ptr,
+            lambda _owner: 8192,
+            previous,
+            slot_prefix_unchanged=True,
+        ), plan
+
+    first, _ = bind([8192, 12288], None)
+    observed.clear()
+    second, plan = bind([8192, 16384], first)
+    assert observed == [owners[1]]
+    stable_segments = int(torch.searchsorted(plan.chunk, 1))
+    assert second.rows[:stable_segments] == first.rows[:stable_segments]
+    expected = bind_copy_addresses(
+        plan,
+        list(addresses.values()),
+        [500000],
+        [8192, 8192],
+        [128],
+        2,
+        device_to_host=False,
+        host_chunk_tokens=[8192, 8192],
+    )
+    assert second.rows == expected
+
+
+def test_incremental_binding_replaces_old_4096_request_end():
+    cycle = module.DmaCycle.build(2304, 8192, [2048])
+    slots = torch.arange(8192)
+    owner = object()
+
+    def bind(end, previous):
+        plan = cycle.plan_ranges(slots, [0], [end])
+        return module.bind_incremental_copy_addresses(
+            plan,
+            [owner],
+            [0],
+            [end],
+            [500000],
+            [128],
+            2,
+            lambda _owner: 100000,
+            lambda _owner: 8192,
+            previous,
+            slot_prefix_unchanged=True,
+        ), plan
+
+    old, _ = bind(4096, None)
+    current, plan = bind(8192, old)
+    assert plan.tokens.sum().item() == 8192
+    assert 4096 not in plan.tokens.cumsum(0).tolist()
+    assert current.rows == bind_copy_addresses(
+        plan,
+        [100000],
+        [500000],
+        [8192],
+        [128],
+        2,
+        device_to_host=False,
+        host_chunk_tokens=[8192],
+    )
 
 
 @pytest.mark.parametrize("bundle,internal", [(512, None), (2304, [2048])])

@@ -130,6 +130,7 @@ class BoundCopyPrefix:
     npu_ptrs: tuple[int, ...]
     plane_widths: tuple[int, ...]
     element_bytes: int
+    segment_chunks: torch.Tensor
     rows: list[list[int]]
 
 
@@ -147,23 +148,45 @@ def bind_incremental_copy_addresses(
     *,
     slot_prefix_unchanged: bool,
 ) -> BoundCopyPrefix:
-    """Reuse bound rows for an unchanged prefix; bind only appended chunks."""
+    """Keep stable rows; replace a grown tail and bind newly appended chunks."""
     npu_ptrs = tuple(npu_ptrs)
     plane_widths = tuple(plane_widths)
     old_count = len(previous.owners) if previous is not None else 0
-    reuse = bool(
+    compatible = bool(
         slot_prefix_unchanged
         and previous is not None
         and old_count <= len(source_objs)
-        and tuple(map(id, source_objs[:old_count])) == previous.owner_ids
-        and tuple(starts[:old_count]) == previous.starts
-        and tuple(ends[:old_count]) == previous.ends
         and npu_ptrs == previous.npu_ptrs
         and plane_widths == previous.plane_widths
         and element_bytes == previous.element_bytes
     )
-    begin_chunk = old_count if reuse else 0
+    current_ids = tuple(map(id, source_objs))
+    stable_before_tail = bool(
+        compatible
+        and old_count > 0
+        and current_ids[: old_count - 1] == previous.owner_ids[: old_count - 1]
+        and tuple(starts[: old_count - 1]) == previous.starts[: old_count - 1]
+        and tuple(ends[: old_count - 1]) == previous.ends[: old_count - 1]
+    )
+    tail_unchanged = (
+        bool(
+            stable_before_tail
+            and current_ids[old_count - 1] == previous.owner_ids[old_count - 1]
+            and starts[old_count - 1] == previous.starts[old_count - 1]
+            and ends[old_count - 1] == previous.ends[old_count - 1]
+        )
+        if old_count
+        else False
+    )
+    begin_chunk = (
+        old_count if tail_unchanged else old_count - 1 if stable_before_tail else 0
+    )
     first_segment = int(torch.searchsorted(plan.chunk, begin_chunk))
+    previous_segments = (
+        int(torch.searchsorted(previous.segment_chunks, begin_chunk))
+        if begin_chunk and previous is not None
+        else 0
+    )
     suffix_plan = DmaPlan(
         plan.chunk[first_segment:] - begin_chunk,
         plan.slot[first_segment:],
@@ -188,15 +211,20 @@ def bind_incremental_copy_addresses(
         if suffix_objs
         else []
     )
-    rows = previous.rows + suffix_rows if reuse else suffix_rows
+    rows = (
+        previous.rows[: previous_segments * len(plane_widths)] + suffix_rows
+        if begin_chunk and previous is not None
+        else suffix_rows
+    )
     return BoundCopyPrefix(
         owners=tuple(source_objs),
-        owner_ids=tuple(map(id, source_objs)),
+        owner_ids=current_ids,
         starts=tuple(starts),
         ends=tuple(ends),
         npu_ptrs=npu_ptrs,
         plane_widths=plane_widths,
         element_bytes=element_bytes,
+        segment_chunks=plan.chunk,
         rows=rows,
     )
 
