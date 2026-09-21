@@ -495,6 +495,13 @@ class AscendLMCacheEngine(LMCacheEngine):
         # request finishes. A Python reference alone does not stop LRU eviction;
         # an extra MemoryObj ref_count does, without PinMonitor's timeout.
         self._layerwise_prefill_page_owners: dict[str, dict[int, MemoryObj]] = {}
+        # P-node layerwise prefill is called once per compute chunk.  Keep the
+        # hash-chain frontier per request and KV group so the next call only
+        # plans the newly appended suffix instead of rescanning every old
+        # LMCache chunk and rechecking its storage state.
+        self._layerwise_prefill_store_frontiers: dict[
+            str, dict[int, tuple[int, Union[int, bytes]]]
+        ] = {}
         self._layerwise_cpu_fill_sources: dict[
             str, dict[int, tuple[_DirectPageBatch, LayerwiseCPUFillLease]]
         ] = {}
@@ -1626,6 +1633,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
         if release_dma is not None:
             release_dma(req_id)
+        self._layerwise_prefill_store_frontiers.pop(req_id, None)
         with self._engine_state_lock:
             owned = self._layerwise_prefill_page_owners.pop(req_id, None)
         if owned is not None:
@@ -3957,6 +3965,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     self._direct_store_states.pop(req_id, None)
             self._live_source_builders.pop(req_id, None)
             self._completed_live_sources.pop(req_id, None)
+            self._layerwise_prefill_store_frontiers.pop(req_id, None)
             pending_diagnostics = getattr(self, "_pending_live_source_diagnostics", None)
             if pending_diagnostics is not None:
                 pending_diagnostics.pop(req_id, None)
@@ -6357,6 +6366,87 @@ class AscendLMCacheEngine(LMCacheEngine):
             retrieve_kwargs["_retrieve_metadata_warm"] = True
         return location, cached_starts, cached_ends, cached_keys
 
+    def _layerwise_prefill_store_plan(
+        self,
+        *,
+        req_id: str,
+        tokens: Union[torch.Tensor, list[int]],
+        mask: Optional[torch.Tensor],
+        request_configs: Optional[dict],
+        kv_group: int,
+        incremental: bool,
+    ) -> tuple[
+        Iterable[tuple[int, int, CacheEngineKey]],
+        int,
+        Optional[tuple[int, Union[int, bytes]]],
+    ]:
+        """Plan only the new P-node suffix when the request grows.
+
+        ``store_layer`` is primed before every chunked-prefill forward.  The
+        old implementation called ``process_tokens`` for the complete prefix
+        on every prime, then checked every old chunk again.  Keep one aligned
+        hash frontier per request/group and start the next plan from it.  The
+        caller publishes the returned frontier only after the store completes,
+        so a failed transfer never makes an unsaved suffix look committed.
+        """
+        full_tokens = len(tokens)
+        if not incremental:
+            return (
+                self.token_database.process_tokens(
+                    tokens=tokens,
+                    mask=mask,
+                    request_configs=request_configs,
+                    kv_group=kv_group,
+                ),
+                0,
+                None,
+            )
+
+        frontiers = self._layerwise_prefill_store_frontiers.setdefault(
+            req_id, {}
+        )
+        previous = frontiers.get(kv_group)
+        if previous is not None:
+            previous_end, previous_hash = previous
+            chunk_size = int(self.config.chunk_size)
+            if (
+                previous_end < 0
+                or previous_end > full_tokens
+                or previous_end % chunk_size != 0
+            ):
+                # A restarted/preempted request may reuse its id with a
+                # shorter prefix.  Discard the stale frontier and rebuild
+                # once; subsequent chunks are incremental again.
+                frontiers.pop(kv_group, None)
+                previous = None
+
+        if previous is None:
+            return (
+                self.token_database.process_tokens(
+                    tokens=tokens,
+                    mask=mask,
+                    request_configs=request_configs,
+                    kv_group=kv_group,
+                ),
+                0,
+                None,
+            )
+
+        previous_end, previous_hash = previous
+        if previous_end == full_tokens:
+            return iter(()), previous_end, previous
+        return (
+            self.token_database.process_tokens_from_prefix(
+                tokens,
+                prefix_token_count=previous_end,
+                prefix_hash=previous_hash,
+                request_configs=request_configs,
+                kv_group=kv_group,
+            ),
+            previous_end,
+            previous,
+        )
+
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
     def store_layer(
@@ -6497,6 +6587,13 @@ class AscendLMCacheEngine(LMCacheEngine):
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
 
+        incremental_prefill = bool(
+            kwargs.get("layerwise_prefill_incremental", False)
+            and deferred_layerwise_put
+            and self._force_layerwise_prefill_store
+            and not kwargs.get("decode_window_save", False)
+        )
+
         # Ensure the connector's MLA/DSA layout is detected before allocating
         # chunks -- get_shape(num_tokens) below depends on kv_lora_rank etc.
         # This also establishes the connector's per-group layout cardinality
@@ -6528,12 +6625,28 @@ class AscendLMCacheEngine(LMCacheEngine):
             "force_store_wait", False
         )
         pending_chunks = []
-        for start, end, key in self.token_database.process_tokens(
-            tokens=tokens, mask=mask, request_configs=request_configs,
-            kv_group=kv_group,
-        ):
+        token_plan, planned_base, prior_frontier = (
+            self._layerwise_prefill_store_plan(
+                req_id=req_id,
+                tokens=tokens,
+                mask=mask,
+                request_configs=request_configs,
+                kv_group=kv_group,
+                incremental=incremental_prefill,
+            )
+        )
+        if incremental_prefill:
+            # The suffix planner may legitimately return no chunks when a
+            # repeated forward has not appended tokens yet.  Preserve the
+            # already committed frontier in that case.
+            requested_end = planned_base
+        latest_full_frontier = prior_frontier
+        chunk_size = int(self.config.chunk_size)
+        for start, end, key in token_plan:
             assert isinstance(key, CacheEngineKey)
             requested_end = end
+            if end - start == chunk_size and end % chunk_size == 0:
+                latest_full_frontier = (end, key.chunk_hash)
 
             keys_multi_layer = key.split_layers(num_layers)
             if self._layerwise_put_queue is not None:
@@ -7164,6 +7277,10 @@ class AscendLMCacheEngine(LMCacheEngine):
         self.stats_monitor.on_store_finished(monitor_req_id, tot_token_num)
         if store_complete:
             store_result.committed_end = requested_end
+            if incremental_prefill and latest_full_frontier is not None:
+                self._layerwise_prefill_store_frontiers.setdefault(
+                    req_id, {}
+                )[kv_group] = latest_full_frontier
         if _mtp_dw_diag_enabled() and kwargs.get("decode_window_save"):
             window_start = kwargs.get("decode_window_start")
             window_end = kwargs.get("decode_window_end")

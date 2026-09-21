@@ -568,6 +568,41 @@ class TestAscendStoreLayerCompletion:
         engine.storage_manager.batched_allocate.return_value = allocation
         return engine
 
+    def test_prefill_store_plan_reuses_committed_prefix(self):
+        engine = SimpleNamespace(
+            config=SimpleNamespace(chunk_size=256),
+            token_database=MagicMock(),
+            _layerwise_prefill_store_frontiers={"req": {0: (256, 17)}},
+        )
+        suffix_key = CacheEngineKey(
+            "model", 1, 0, 0, torch.float16, kv_group=0
+        )
+        engine.token_database.process_tokens_from_prefix.return_value = iter(
+            ((256, 512, suffix_key),)
+        )
+
+        plan, base, frontier = AscendLMCacheEngine._layerwise_prefill_store_plan(
+            engine,
+            req_id="req",
+            tokens=[0] * 512,
+            mask=torch.ones(512, dtype=torch.bool),
+            request_configs=None,
+            kv_group=0,
+            incremental=True,
+        )
+
+        assert base == 256
+        assert frontier == (256, 17)
+        assert list(plan) == [(256, 512, suffix_key)]
+        engine.token_database.process_tokens.assert_not_called()
+        engine.token_database.process_tokens_from_prefix.assert_called_once_with(
+            [0] * 512,
+            prefix_token_count=256,
+            prefix_hash=17,
+            request_configs=None,
+            kv_group=0,
+        )
+
     def test_reports_fully_stored_prefix_as_committed(self):
         engine = self._engine(stored=True)
 
