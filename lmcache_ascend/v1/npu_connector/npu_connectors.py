@@ -124,6 +124,25 @@ def _layer_memory_tensor(memory_obj: MemoryObj, layer_id: int) -> torch.Tensor:
     return tensor
 
 
+def _layer_memory_host_ptr(memory_obj: MemoryObj, layer_id: int) -> int:
+    """Return a layer source address without materializing a tensor view.
+
+    P-node prefill DMA only needs the raw host address.  Layer pages already
+    store one homogeneous all-layer allocation, so constructing a typed
+    ``torch.Tensor`` view for every layer/chunk is unnecessary preparation
+    work.  Keep the legacy tensor path for non-page objects.
+    """
+    if isinstance(memory_obj, LayerPageMemoryObj):
+        return int(memory_obj.layer_data_ptr(layer_id))
+    data_ptr = getattr(memory_obj, "data_ptr", None)
+    if isinstance(data_ptr, int):
+        return int(data_ptr)
+    if callable(data_ptr):
+        return int(data_ptr())
+    tensor = _layer_memory_tensor(memory_obj, layer_id)
+    return int(tensor.data_ptr())
+
+
 def _layer_source_tensors(
     source: Union[List[MemoryObj], LayerPageSource],
     layer_id: int,
@@ -7113,50 +7132,73 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             deferred_dense_validation_keys: List[tuple] = []
             deferred_dma_copies: List[List[tuple[int, int, int]]] = []
             if deferred_layerwise_put and dense_direct:
-                deferred_dense_layer_tensors = []
-                for layer_id, memory_objs_layer in enumerate(memory_objs):
-                    layer_tensors = []
-                    for chunk_index, memory_obj in enumerate(memory_objs_layer):
-                        tensor = _layer_memory_tensor(memory_obj, layer_id)
-                        if tensor is None:
-                            raise ValueError(
-                                "Dense direct layerwise store received a "
-                                "MemoryObj without a tensor at "
-                                f"layer={layer_id}, chunk={chunk_index}."
-                            )
-                        if memory_obj.metadata.fmt != expected_fmt:
-                            raise ValueError(
-                                f"Expected memory format {expected_fmt}, "
-                                f"got {memory_obj.metadata.fmt}."
-                            )
-                        layer_tensors.append(tensor)
-                    if len(layer_tensors) != len(starts):
-                        raise ValueError(
-                            "Dense direct layerwise store chunk count mismatch: "
-                            f"layer={layer_id}, tensors={len(layer_tensors)}, "
-                            f"ranges={len(starts)}"
-                        )
-                    deferred_dense_layer_tensors.append(layer_tensors)
-
                 if prefill_dma:
                     assert dma_plans is not None
                     widths = self.checkpoint_plane_widths(kv_group)
-                    host_chunk_tokens = [
-                        int(t.numel()) // sum(widths)
-                        for t in deferred_dense_layer_tensors[0]
-                    ]
-                    for layer_id, layer_tensors in enumerate(
-                        deferred_dense_layer_tensors
-                    ):
+                    # Layer pages already expose their physical layout and
+                    # valid token count.  Do not materialize one tensor view
+                    # per layer just to obtain a pointer for memcpy.
+                    first_layer = memory_objs[0]
+                    host_chunk_tokens = []
+                    for memory_obj in first_layer:
+                        if isinstance(memory_obj, LayerPageMemoryObj):
+                            host_chunk_tokens.append(int(memory_obj.valid_tokens))
+                        else:
+                            tensor = _layer_memory_tensor(memory_obj, 0)
+                            host_chunk_tokens.append(
+                                self._lmc_plane_num_tokens(tensor, kv_group)
+                            )
+                    for layer_id, memory_objs_layer in enumerate(memory_objs):
+                        host_ptrs = []
+                        for chunk_index, memory_obj in enumerate(memory_objs_layer):
+                            if memory_obj.metadata.fmt != expected_fmt:
+                                raise ValueError(
+                                    f"Expected memory format {expected_fmt}, "
+                                    f"got {memory_obj.metadata.fmt}."
+                                )
+                            host_ptrs.append(
+                                _layer_memory_host_ptr(memory_obj, layer_id)
+                            )
+                        if len(host_ptrs) != len(starts):
+                            raise ValueError(
+                                "Dense direct layerwise store chunk count mismatch: "
+                                f"layer={layer_id}, pointers={len(host_ptrs)}, "
+                                f"ranges={len(starts)}"
+                            )
                         deferred_dma_copies.append(bind_copy_addresses(
                             dma_plans[layer_id % 2],
-                            [int(t.data_ptr()) for t in layer_tensors],
+                            host_ptrs,
                             [int(t.data_ptr()) for t in kvcaches_snapshot[layer_id]],
                             chunk_sizes, widths,
                             int(kvcaches_snapshot[layer_id][0].element_size()),
                             device_to_host=True,
                             host_chunk_tokens=host_chunk_tokens,
                         ))
+                else:
+                    deferred_dense_layer_tensors = []
+                    for layer_id, memory_objs_layer in enumerate(memory_objs):
+                        layer_tensors = []
+                        for chunk_index, memory_obj in enumerate(memory_objs_layer):
+                            tensor = _layer_memory_tensor(memory_obj, layer_id)
+                            if tensor is None:
+                                raise ValueError(
+                                    "Dense direct layerwise store received a "
+                                    "MemoryObj without a tensor at "
+                                    f"layer={layer_id}, chunk={chunk_index}."
+                                )
+                            if memory_obj.metadata.fmt != expected_fmt:
+                                raise ValueError(
+                                    f"Expected memory format {expected_fmt}, "
+                                    f"got {memory_obj.metadata.fmt}."
+                                )
+                            layer_tensors.append(tensor)
+                        if len(layer_tensors) != len(starts):
+                            raise ValueError(
+                                "Dense direct layerwise store chunk count mismatch: "
+                                f"layer={layer_id}, tensors={len(layer_tensors)}, "
+                                f"ranges={len(starts)}"
+                            )
+                        deferred_dense_layer_tensors.append(layer_tensors)
 
                 if not prefill_dma:
                     self.append_sparse_chunk_ptr_cache_for_layers(
