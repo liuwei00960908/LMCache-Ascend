@@ -118,6 +118,68 @@ class DmaCycle:
             chunk, slots[begin - slot_mapping_base], begin - starts[chunk], stop - begin
         )
 
+    def plan_block_id_ranges(
+        self, block_ids, block_size: int, starts, ends, slot_mapping_base=0
+    ):
+        """Plan ranges from block IDs without materializing per-token slots."""
+        if block_size <= 0:
+            raise ValueError("DMA block size must be positive")
+        block_ids = torch.as_tensor(block_ids, dtype=torch.long)
+        starts = torch.as_tensor(starts, dtype=torch.long)
+        ends = torch.as_tensor(ends, dtype=torch.long)
+        if block_ids.numel() == 0 or starts.numel() == 0:
+            return DmaPlan(
+                torch.empty(0, dtype=torch.long),
+                torch.empty(0, dtype=torch.long),
+                torch.empty(0, dtype=torch.long),
+                torch.empty(0, dtype=torch.long),
+            )
+        if bool((starts < slot_mapping_base).any()) or bool((ends <= starts).any()):
+            raise ValueError("DMA block-id ranges are invalid")
+        logical_end = int(ends[-1]) - slot_mapping_base
+        if logical_end > block_ids.numel() * block_size:
+            raise ValueError("DMA block IDs do not cover the requested range")
+        periods = torch.arange(
+            int(starts[0] - slot_mapping_base) // self.period,
+            (logical_end + self.period - 1) // self.period,
+        )
+        periodic = periods[:, None] * self.period + self.boundaries[None, :]
+        block_starts = torch.arange(
+            0, block_ids.numel() * block_size, block_size, dtype=torch.long
+        )
+        block_gaps = torch.cat(
+            (
+                torch.zeros(1, dtype=torch.bool),
+                block_ids[1:] != block_ids[:-1] + 1,
+            )
+        )
+        gap_edges = block_starts[block_gaps]
+        edges = torch.unique(
+            torch.cat(
+                (
+                    periodic.flatten() + slot_mapping_base,
+                    starts,
+                    ends,
+                    gap_edges + slot_mapping_base,
+                )
+            ),
+            sorted=True,
+        )
+        edges = edges[(edges >= starts[0]) & (edges <= ends[-1])]
+        begin, stop = edges[:-1], edges[1:]
+        chunk = torch.searchsorted(ends, begin, right=True)
+        active = (begin >= starts[chunk]) & (stop <= ends[chunk])
+        begin, stop, chunk = begin[active], stop[active], chunk[active]
+        relative = begin - slot_mapping_base
+        block_index = relative // block_size
+        slots = block_ids[block_index] * block_size + relative % block_size
+        return DmaPlan(
+            chunk,
+            slots,
+            begin - starts[chunk],
+            stop - begin,
+        )
+
 
 @dataclass(frozen=True)
 class BoundCopyPrefix:

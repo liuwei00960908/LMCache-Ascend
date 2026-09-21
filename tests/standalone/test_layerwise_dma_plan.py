@@ -123,6 +123,30 @@ def test_periodic_plan_matches_token_reference(bundle, chunk):
             assert torch.equal(getattr(actual, field), getattr(expected, field))
 
 
+@pytest.mark.parametrize("bundle,internal", [(512, None), (2304, [2048])])
+def test_block_id_plan_matches_full_slot_plan_without_token_map(bundle, internal):
+    block_size = 128
+    length = 81920
+    block_ids = torch.arange((length + block_size - 1) // block_size)
+    slots = torch.arange(length)
+    cycle = module.DmaCycle.build(bundle, 1024, internal)
+    starts = list(range(0, length, 1024))
+    ends = [min(start + 1024, length) for start in starts]
+    full = cycle.plan_ranges(slots, starts, ends)
+    by_blocks = cycle.plan_block_id_ranges(block_ids, block_size, starts, ends)
+    for field in ("chunk", "slot", "chunk_token", "tokens"):
+        assert torch.equal(getattr(full, field), getattr(by_blocks, field))
+
+
+def test_block_id_plan_splits_noncontiguous_physical_blocks():
+    cycle = module.DmaCycle.build(8, 16)
+    plan = cycle.plan_block_id_ranges([4, 5, 9, 10], 4, [0], [16])
+    assert list(zip(plan.slot.tolist(), plan.tokens.tolist(), strict=False)) == [
+        (16, 8),
+        (36, 8),
+    ]
+
+
 def test_cycles_derive_actual_layout():
     latent = torch.empty((2, 128, 576))
     index = torch.empty((2, 128, 128))

@@ -246,7 +246,8 @@ def _cached_layerwise_slot_mapping(
 
 
 def _prefill_dma_plans(
-    cpu_slots_by_bank: Sequence[torch.Tensor],
+    block_ids_by_bank: Sequence[Sequence[int]],
+    block_size: int,
     starts: Sequence[int],
     ends: Sequence[int],
     slot_mapping_base: int,
@@ -262,17 +263,20 @@ def _prefill_dma_plans(
     Only segment boundaries are indexed; no token scan or D2H sync is needed.
     """
     started = time.perf_counter() if prefill_start_timing_enabled() else 0.0
-    if len(cpu_slots_by_bank) != 2:
-        raise ValueError("Layerwise prefill DMA requires two CPU bank maps")
-    if (cpu_slots_by_bank[0].device.type != "cpu"
-            or cpu_slots_by_bank[1].device.type != "cpu"):
-        raise ValueError("Layerwise prefill DMA needs CPU slot maps")
+    if len(block_ids_by_bank) != 2:
+        raise ValueError("Layerwise prefill DMA requires two bank block maps")
     if (not kvcaches[0][0].is_contiguous()
             or not kvcaches[0][-1].is_contiguous()):
         raise ValueError("Layerwise prefill DMA requires contiguous NPU planes")
     plans = (
-        cycle.plan_ranges(cpu_slots_by_bank[0], starts, ends, slot_mapping_base),
-        cycle.plan_ranges(cpu_slots_by_bank[1], starts, ends, slot_mapping_base),
+        cycle.plan_block_id_ranges(
+            block_ids_by_bank[0], block_size,
+            starts, ends, slot_mapping_base,
+        ),
+        cycle.plan_block_id_ranges(
+            block_ids_by_bank[1], block_size,
+            starts, ends, slot_mapping_base,
+        ),
     )
     capacity = int(kvcaches[0][0].shape[0]) * int(kvcaches[0][0].shape[1])
     if (bool((plans[0].slot + plans[0].tokens > capacity).any())
@@ -5529,11 +5533,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             kwargs.get("deferred_layerwise_get", False)
         )
         deferred_dense_direct_get = deferred_layerwise_get and dense_direct
-        if kwargs.get("prefill_dma_cpu_slots_by_bank") is not None and not dense_direct:
+        if kwargs.get("prefill_dma_block_ids_by_bank") is not None and not dense_direct:
             raise RuntimeError("Layerwise prefill DMA requires dense direct load")
         prefill_dma = bool(
             deferred_dense_direct_get
-            and kwargs.get("prefill_dma_cpu_slots_by_bank") is not None
+            and kwargs.get("prefill_dma_block_ids_by_bank") is not None
         )
         if prefill_dma and not hasattr(lmc_ops, "layerwise_prefill_dma_copy"):
             raise RuntimeError(
@@ -5579,19 +5583,16 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             chunk_sizes.append(chunk_size)
             current_offset += chunk_size
 
-        slot_mappings = {} if deferred_layerwise_get else None
-        setup_mapping = (
-            kwargs["prefill_dma_cpu_slots_by_bank"][0]
-            if prefill_dma else slot_mapping
-        )
-        slot_mapping_chunks, slot_mapping_full, _ = _cached_layerwise_slot_mapping(
-            slot_mappings,
-            setup_mapping,
-            starts,
-            ends,
-        )
+        slot_mappings = {} if deferred_layerwise_get and not prefill_dma else None
+        if prefill_dma:
+            slot_mapping_chunks = ()
+            slot_mapping_full = torch.empty(0, dtype=torch.long)
+        else:
+            slot_mapping_chunks, slot_mapping_full, _ = _cached_layerwise_slot_mapping(
+                slot_mappings, slot_mapping, starts, ends
+            )
 
-        num_tokens = len(slot_mapping_full)
+        num_tokens = sum(chunk_sizes)
         self._check_layerwise_transfer_invariants(
             operation="retrieve",
             kv_group=kv_group,
@@ -5620,8 +5621,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         bound_loads = None
         if prefill_dma:
             dma_plans = _prefill_dma_plans(
-                kwargs["prefill_dma_cpu_slots_by_bank"], starts, ends, 0,
-                chunk_sizes, kv_group, kvcaches_snapshot, "load",
+                kwargs["prefill_dma_block_ids_by_bank"],
+                int(kwargs["prefill_dma_block_size"]),
+                starts, ends, 0, chunk_sizes, kv_group, kvcaches_snapshot, "load",
                 self.prefill_dma_cycles[kv_group],
             )
             if isinstance(dma_req_id, str) and dma_req_id:
@@ -5631,19 +5633,20 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 slot_snapshots = self._prefill_dma_slot_snapshots.setdefault(
                     dma_req_id, {}
                 )
-                for bank, slots in enumerate(
-                    kwargs["prefill_dma_cpu_slots_by_bank"]
+                for bank, bank_block_ids in enumerate(
+                    kwargs["prefill_dma_block_ids_by_bank"]
                 ):
-                    old_slots = slot_snapshots.get((kv_group, bank))
-                    if old_slots is None or (
-                        len(slots) < len(old_slots)
-                        or not torch.equal(old_slots, slots[:len(old_slots)])
+                    block_ids = tuple(bank_block_ids)
+                    old_block_ids = slot_snapshots.get((kv_group, bank))
+                    if old_block_ids is None or (
+                        len(block_ids) < len(old_block_ids)
+                        or block_ids[:len(old_block_ids)] != old_block_ids
                     ):
                         for cache_key in tuple(bound_loads):
                             if (cache_key[0] == kv_group
                                     and cache_key[1] % 2 == bank):
                                 bound_loads.pop(cache_key)
-                    slot_snapshots[(kv_group, bank)] = slots.clone()
+                    slot_snapshots[(kv_group, bank)] = block_ids
         if dense_direct and not prefill_dma:
             (
                 dense_fixed_chunk_size,
@@ -6921,9 +6924,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         deferred_layerwise_put = bool(kwargs.get("deferred_layerwise_put", False))
         prefill_dma = bool(
             deferred_layerwise_put and dense_direct
-            and kwargs.get("prefill_dma_cpu_slots_by_bank") is not None
+            and kwargs.get("prefill_dma_block_ids_by_bank") is not None
         )
-        if kwargs.get("prefill_dma_cpu_slots_by_bank") is not None and not dense_direct:
+        if kwargs.get("prefill_dma_block_ids_by_bank") is not None and not dense_direct:
             raise RuntimeError("Layerwise prefill DMA requires dense direct store")
         if prefill_dma and not hasattr(lmc_ops, "layerwise_prefill_dma_copy"):
             raise RuntimeError(
@@ -6933,20 +6936,16 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             KVCacheFormat.MLA_LATENT, KVCacheFormat.DSA_INDEX
         ):
             raise ValueError("Layerwise prefill DMA requires two-group DSA KV")
-        slot_mappings = {} if deferred_layerwise_put else None
-        setup_mapping = (
-            kwargs["prefill_dma_cpu_slots_by_bank"][0]
-            if prefill_dma else slot_mapping
-        )
-        slot_mapping_chunks, slot_mapping_full, _ = _cached_layerwise_slot_mapping(
-            slot_mappings,
-            setup_mapping,
-            starts,
-            ends,
-            0 if prefill_dma else slot_mapping_base,
-        )
+        slot_mappings = {} if deferred_layerwise_put and not prefill_dma else None
+        if prefill_dma:
+            slot_mapping_chunks = ()
+            slot_mapping_full = torch.empty(0, dtype=torch.long)
+        else:
+            slot_mapping_chunks, slot_mapping_full, _ = _cached_layerwise_slot_mapping(
+                slot_mappings, slot_mapping, starts, ends, slot_mapping_base
+            )
 
-        num_tokens = len(slot_mapping_full)
+        num_tokens = sum(chunk_sizes)
         self._check_layerwise_transfer_invariants(
             operation="store",
             kv_group=kv_group,
@@ -6976,8 +6975,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         dma_plans = None
         if prefill_dma:
             dma_plans = _prefill_dma_plans(
-                kwargs["prefill_dma_cpu_slots_by_bank"], starts, ends,
-                0, chunk_sizes, kv_group, kvcaches_snapshot, "store",
+                kwargs["prefill_dma_block_ids_by_bank"],
+                int(kwargs["prefill_dma_block_size"]),
+                starts, ends, 0, chunk_sizes, kv_group, kvcaches_snapshot, "store",
                 self.prefill_dma_cycles[kv_group],
             )
         if dense_direct and not prefill_dma:
