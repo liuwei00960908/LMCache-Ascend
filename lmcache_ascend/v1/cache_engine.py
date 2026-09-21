@@ -6593,6 +6593,13 @@ class AscendLMCacheEngine(LMCacheEngine):
             and self._force_layerwise_prefill_store
             and not kwargs.get("decode_window_save", False)
         )
+        # Profile-only prime stages close the deferred generator before the
+        # normal per-layer callbacks run.  They still need to advance the
+        # request frontier; otherwise every following chunk is planned from
+        # token zero and the diagnostic run allocates the cumulative prefix.
+        diagnostic_prime_only = bool(
+            getattr(self, "_layerwise_prefill_diagnostic_prime_only", False)
+        )
 
         # Ensure the connector's MLA/DSA layout is detected before allocating
         # chunks -- get_shape(num_tokens) below depends on kv_lora_rank etc.
@@ -7038,6 +7045,15 @@ class AscendLMCacheEngine(LMCacheEngine):
                         memory_objs, starts, ends, **kwargs
                     )
                     next(mem_obj_generator)
+
+                    if (
+                        diagnostic_prime_only
+                        and incremental_prefill
+                        and latest_full_frontier is not None
+                    ):
+                        self._layerwise_prefill_store_frontiers.setdefault(
+                            req_id, {}
+                        )[kv_group] = latest_full_frontier
 
                     def publish_completed_layer(layer_id: int) -> None:
                         self._append_layer_store_tensors(

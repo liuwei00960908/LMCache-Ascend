@@ -54,6 +54,7 @@ def _owner() -> object:
     owner = type("Owner", (), namespace)()
     owner._engine_state_lock = threading.RLock()
     owner._layerwise_prefill_page_owners = {}
+    owner._layerwise_prefill_store_frontiers = {}
     return owner
 
 
