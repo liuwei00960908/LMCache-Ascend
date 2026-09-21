@@ -10,20 +10,46 @@ from typing import Callable, Sequence
 import torch
 
 
+def cache_page_size_bytes(cache) -> int:
+    """Return one allocator page's bytes for tensor or tuple-plane caches."""
+    if isinstance(cache, (tuple, list)):
+        first = cache[0]
+        page_bytes = first[0].numel() * first.element_size()
+        if len(cache) > 1:
+            second = cache[1]
+            page_bytes += second[0].numel() * second.element_size()
+        return int(page_bytes)
+    return int(cache[0].numel() * cache.element_size())
+
+
 def build_group_cycles(
     latent, indexer, chunk_tokens, multiplier, latent_plane_widths=None
 ):
     """Derive the same byte bundle as the shared-block allocator at startup."""
-    latent_page = latent[0].numel() * latent.element_size()
-    index_page = indexer[0].numel() * indexer.element_size()
+    latent_page = cache_page_size_bytes(latent)
+    index_page = cache_page_size_bytes(indexer)
     bundle_bytes = math.lcm(latent_page, index_page) * multiplier
-    index_tokens = bundle_bytes // index_page * indexer.shape[1]
+    latent_block_tokens = (
+        latent[0].shape[1] if isinstance(latent, (tuple, list)) else latent.shape[1]
+    )
+    indexer_block_tokens = (
+        indexer[0].shape[1]
+        if isinstance(indexer, (tuple, list))
+        else indexer.shape[1]
+    )
+    index_tokens = bundle_bytes // index_page * indexer_block_tokens
     widths = torch.as_tensor(
-        latent_plane_widths or [latent.shape[-1]], dtype=torch.long
+        latent_plane_widths
+        or ([latent[0].shape[-1], latent[1].shape[-1]]
+            if isinstance(latent, (tuple, list))
+            else [latent.shape[-1]]),
+        dtype=torch.long,
     )
     index_splits = (widths.cumsum(0)[:-1] * index_tokens) // widths.sum()
     return (
-        DmaCycle.build(bundle_bytes // latent_page * latent.shape[1], chunk_tokens),
+        DmaCycle.build(
+            bundle_bytes // latent_page * latent_block_tokens, chunk_tokens
+        ),
         DmaCycle.build(index_tokens, chunk_tokens, index_splits),
     )
 

@@ -39,14 +39,17 @@ class LMCacheAscendConnectorV1Dynamic(LMCacheConnectorV1Dynamic):
             from vllm.v1.core.dsa_shared_pool import (
                 DSASharedBlockLayout, layerwise_prefill_bundle_multiplier,
             )
-            from lmcache_ascend.v1.npu_connector.layerwise_dma import build_group_cycles
+            from lmcache_ascend.v1.npu_connector.layerwise_dma import (
+                build_group_cycles,
+                cache_page_size_bytes,
+            )
 
             latent = impl._kvcaches_for_group(0)[0]
             indexer = impl._kvcaches_for_group(1)[0]
             # Match the scheduler's layout construction, including its slab split.
             layout = DSASharedBlockLayout(
-                latent_page_size_bytes=latent[0].numel() * latent.element_size(),
-                indexer_page_size_bytes=indexer[0].numel() * indexer.element_size(),
+                latent_page_size_bytes=cache_page_size_bytes(latent),
+                indexer_page_size_bytes=cache_page_size_bytes(indexer),
                 capacity_bundles=1,
                 bundle_multiplier=layerwise_prefill_bundle_multiplier(),
             )

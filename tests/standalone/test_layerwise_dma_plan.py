@@ -158,6 +158,15 @@ def test_cycles_derive_actual_layout():
     assert c.chunk_tokens == 2048
 
 
+def test_cycles_accept_tuple_plane_caches():
+    latent = (torch.empty((2, 128, 512)), torch.empty((2, 128, 64)))
+    index = (torch.empty((2, 128, 128)),)
+    latent_cycle, index_cycle = module.build_group_cycles(
+        latent, index, 1024, 2, (512, 64)
+    )
+    assert (latent_cycle.bundle_tokens, index_cycle.bundle_tokens) == (512, 2304)
+
+
 def test_no_python_loops_in_dma_planner_or_binding():
     tree = ast.parse(MODULE_PATH.read_text())
     assert not any(
